@@ -43,6 +43,13 @@ Full details in the bundled README/INSTALL and on GitHub:
 - Forge Neo: **https://github.com/TdogCreations/forge-neo-krea2-toolkit**
 - ComfyUI nodes (moodboard + identity edit + fusion, with ready-made example workflows): **https://github.com/TdogCreations/ComfyUI-Krea2Moodboard**
 
+### Workflows included (ComfyUI)
+- **Basic moodboard t2i** and **identity edit + moodboard fusion** — lean examples, core nodes + the
+  pack only, ready to run.
+- **Krea_Workflow_Public** — the full production pipeline (JoyCaption auto-captioning of your
+  references, wildcards, fusion, AR handling, upscale pass). Needs ~12 common node packs — the full
+  dependency table is in the GitHub README; everything installs via ComfyUI-Manager.
+
 ### Credits
 [Haoming02](https://github.com/Haoming02) (Forge Neo) · [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
 (Qwen3-VL ports) · [lbouaraba](https://github.com/lbouaraba/comfyui-krea2edit) (identity-edit recipe +
