@@ -1,0 +1,560 @@
+diff --git a/backend/diffusion_engine/krea.py b/backend/diffusion_engine/krea.py
+index 43865585..d77a85fb 100644
+--- a/backend/diffusion_engine/krea.py
++++ b/backend/diffusion_engine/krea.py
+@@ -1,13 +1,21 @@
++import math
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    from modules.prompt_parser import SdConditioning
++
+ import torch
+ from huggingface_guess import model_list
+ 
+ from backend import memory_management
++from backend.args import dynamic_args
+ from backend.diffusion_engine.base import ForgeDiffusionEngine, ForgeObjects
+ from backend.modules.k_prediction import PredictionDiscreteFlow
+ from backend.patcher.clip import CLIP
+ from backend.patcher.unet import UnetPatcher
+ from backend.patcher.vae import VAE
+ from backend.text_processing.qwen3vl_engine import Qwen3VLTextProcessingEngine
++from modules.shared import opts
+ 
+ 
+ class Krea2(ForgeDiffusionEngine):
+@@ -35,11 +43,219 @@ class Krea2(ForgeDiffusionEngine):
+ 
+         self.is_wan = True
+ 
++        # Moodboard state (armed by the sd-forge-krea2-moodboard extension) and identity-edit state
++        # (armed by sd-forge-krea2-edit); both consumed single-shot by the next positive-prompt
++        # conditioning, mirroring QwenImage's images_vl/image_prompt pattern.
++        self.clear_moodboard()
++        self.clear_edit()
++
++    # Declarative sentences adjacent to the vision blocks: K2 reads the whole context as a description
++    # of the target image, so these steer whether the references contribute style or subject.
++    KREA2_STYLE_DIRECTIVE = (
++        "The image uses only the art style, color palette, lighting, texture, rendering technique and "
++        "overall mood of the reference images. The subjects, objects and composition of the image come "
++        "from the following text description alone. "
++    )
++    KREA2_SUBJECT_DIRECTIVE = (
++        "The image depicts the same subjects, objects and composition as the reference images, "
++        "rendered in the art style described by the following text. "
++    )
++    VISION_BLOCK = "<|vision_start|><|image_pad|><|vision_end|>"
++
++    def clear_moodboard(self):
++        self.images_vl = []
++        self.image_prompt = ""
++        self.moodboard_strength = 1.0
++        self.moodboard_position = "before"
++        self.moodboard_extract = "style"
++        self.moodboard_style_directive = False
++        self.moodboard_hide_refs = False
++
++    def clear_edit(self):
++        self.edit_images_vl = []
++        self.edit_ref_latents = []
++        self.edit_prompt = ""
++
++    @property
++    def moodboard_available(self):
++        """True when the loaded text encoder carries the Qwen3-VL vision tower."""
++        return hasattr(self.text_processing_engine_qwen.text_encoder, "visual")
++
++    @staticmethod
++    def _expand_style_crops(images: list[torch.Tensor], n: int = 2) -> list[torch.Tensor]:
++        """Split each reference into an n x n grid of crops, order-shuffled: composition/pose cannot
++        survive, while palette/texture/lighting are present in every crop. n=2 (quadrants) keeps some
++        object-level content per crop; n=4 (fine tiles) leaves mostly texture/palette-level content."""
++        orders = {
++            2: (2, 0, 3, 1),
++            4: (10, 3, 12, 5, 0, 15, 6, 9, 2, 13, 4, 11, 8, 1, 14, 7),
++        }
++        order = orders.get(n) or tuple(range(n * n))
++        crops = []
++        for image in images:
++            h, w = image.shape[1] // n, image.shape[2] // n
++            grid = [image[:, r * h:(r + 1) * h, c * w:(c + 1) * w] for r in range(n) for c in range(n)]
++            crops.extend(grid[i] for i in order)
++        return crops
++
+     @torch.inference_mode()
+-    def get_learned_conditioning(self, prompt: list[str]):
++    def arm_moodboard(self, images: list[torch.Tensor], strength: float = 1.0, position: str = "before", crops: int = 0, style_directive: bool = False, hide_refs: bool = False, extract: str = "style"):
++        """Set reference images (each (1, H, W, C), values 0..1) as style/vibe conditioning for the
++        next positive-prompt encoding.
++
++        strength: 1.0 = raw reference detail; lower = purer extract of the selected aspect.
++        extract: "style" (palette/texture/mood; subjects fade) or "subject" (whitened structure;
++        the prompt controls the look). position: image tokens "before" or "after" the prompt.
++        crops: 0 = whole images; 2 = shuffled quadrants; 4 = fine 4x4 tiles (texture/palette only).
++        style_directive: add a declarative extract-matching sentence next to the vision block.
++        hide_refs: drop the reference tokens from the final conditioning — the DiT never sees them;
++        style arrives only via the prompt tokens' attention to the refs (needs position "before")."""
++        self.clear_moodboard()
++        self.moodboard_strength = float(strength)
++        self.moodboard_position = position
++        self.moodboard_extract = "subject" if str(extract).startswith("subject") else "style"
++        self.moodboard_style_directive = bool(style_directive)
++        self.moodboard_hide_refs = bool(hide_refs)
++
++        # Pixel budget for the vision encoder: 384x384-area (fast) or a 1 MP cap that never upscales.
++        budget = str(getattr(opts, "krea2_moodboard_vision_budget", "384"))
++        high_detail = budget.startswith("1024")
++        total = int(1024 * 1024) if high_detail else int(384 * 384)
++
++        n_refs = len(images)
++        if crops and crops > 1:
++            images = self._expand_style_crops(images, n=int(crops))
++            total = total // (3 if crops == 2 else 12)
++
++        token_counts = []
++        for image in images:
++            samples = image.movedim(-1, 1)  # b, c, h, w
++            scale_by = math.sqrt(total / (samples.shape[3] * samples.shape[2]))
++            if high_detail:
++                scale_by = min(1.0, scale_by)
++            width = round(samples.shape[3] * scale_by)
++            height = round(samples.shape[2] * scale_by)
++
++            s = torch.nn.functional.interpolate(samples, size=(height, width), mode="area")
++            self.images_vl.append(s.movedim(1, -1)[:, :, :, :3])
++            token_counts.append(max(1, (height // 32)) * max(1, (width // 32)))  # patch 16, spatial merge 2
++
++        # ONE vision block regardless of reference count: repeated blocks (or "Picture N:" labels)
++        # read to K2 as "an image containing N pictures" and produce grid/collage outputs — all
++        # reference tokens are packed into a single span instead (list-data preprocess_embed).
++        self.image_prompt = self.VISION_BLOCK
++
++        crops_note = f" ({n_refs} reference(s) as {crops}x{crops} crops)" if crops and crops > 1 else ""
++        directive_note = ", directive" if self.moodboard_style_directive else ""
++        hide_note = ", refs hidden from DiT" if self.moodboard_hide_refs else ""
++        print(f"[Krea2 Moodboard] armed {len(self.images_vl)} image(s){crops_note} packed into 1 vision span, ~{sum(token_counts)} vision tokens {token_counts}, extract {self.moodboard_extract}, strength {self.moodboard_strength:g}, position {self.moodboard_position}{directive_note}{hide_note}")
++
++    @torch.inference_mode()
++    def arm_edit(self, images: list[torch.Tensor], grounding_px: int = 768):
++        """Arm identity-edit conditioning (for krea2_edit LoRAs, e.g. krea2_identity_edit_v1).
++
++        Dual conditioning, training-matched: each source image (1, H, W, C, values 0..1) is
++        (1) grounded into the instruction through Qwen3-VL (semantic path) and (2) VAE-encoded for
++        the DiT's in-context frame-1..N appearance path. Two-ref order: scene first, subject second.
++        grounding_px caps the longest side fed to the VLM (the LoRA trained with 384-768px jitter)."""
++        self.clear_edit()
++        for image in images:
++            samples = image.movedim(-1, 1)  # b, c, h, w
++
++            h, w = samples.shape[2], samples.shape[3]
++            if grounding_px and max(h, w) > grounding_px:
++                scale_by = grounding_px / max(h, w)
++                vl = torch.nn.functional.interpolate(samples, size=(round(h * scale_by), round(w * scale_by)), mode="area")
++            else:
++                vl = samples
++            self.edit_images_vl.append(vl.movedim(1, -1)[:, :, :, :3])
++
++            # Appearance path: encode at source resolution; the DiT resizes in latent space.
++            sample = self.forge_objects.vae.encode(samples.movedim(1, -1)[:, :, :, :3])
++            self.edit_ref_latents.append(self.forge_objects.vae.first_stage_model.process_in(sample))
++
++            self.edit_prompt += self.VISION_BLOCK
++
++        print(f"[Krea2 Edit] armed {len(self.edit_images_vl)} source image(s), grounding_px {grounding_px}")
++
++    @torch.inference_mode()
++    def get_learned_conditioning(self, prompt: "SdConditioning"):
+         memory_management.load_model_gpu(self.forge_objects.clip.patcher)
++        if self.edit_prompt:
++            return self.get_learned_conditioning_edit(prompt)
++        if not getattr(prompt, "is_negative_prompt", False):
++            if self.image_prompt:
++                return self.get_learned_conditioning_with_image(prompt)
++            else:
++                self.images_vl = []
++                dynamic_args["ref_latents"].clear()
+         return self.text_processing_engine_qwen(prompt)
+ 
++    @torch.inference_mode()
++    def get_learned_conditioning_with_image(self, prompt: list[str]):
++        engine = self.text_processing_engine_qwen
++        engine.text_encoder.native_vision_inputs = getattr(opts, "krea2_moodboard_native_vision", True)
++        engine.moodboard_strength = self.moodboard_strength
++        engine.moodboard_hide_refs = self.moodboard_hide_refs
++        engine.moodboard_extract = self.moodboard_extract
++        joined = "".join(prompt)
++        directive = ""
++        if self.moodboard_style_directive:
++            directive = self.KREA2_SUBJECT_DIRECTIVE if self.moodboard_extract == "subject" else self.KREA2_STYLE_DIRECTIVE
++        if self.moodboard_position == "after":
++            text = joined + (" " + directive if directive else "") + self.image_prompt
++        else:
++            text = self.image_prompt + directive + joined
++        # All reference tensors ride in ONE image entry -> one packed vision span (grid-safe).
++        cond = engine([text], images=[self.images_vl])
++        engine.moodboard_strength = 1.0
++        engine.moodboard_hide_refs = False
++        engine.moodboard_extract = "style"
++        self.clear_moodboard()
++        return cond
++
++    @torch.inference_mode()
++    def get_learned_conditioning_edit(self, prompt: "SdConditioning"):
++        # krea2_edit dual conditioning. The NEGATIVE is grounded too (training's unconditional is an
++        # empty prompt + the same image) — required for the CFG > 1 recipes (e.g. removals on Raw).
++        # The negative pass runs first and does not consume the armed state; the positive pass then
++        # consumes it and publishes the ref latents for the DiT's in-context path.
++        #
++        # If the moodboard is ALSO armed, its blocks are fused in FRONT of the edit conditioning on
++        # the positive side only: style from the moodboard (hidden/pooled spans), identity from the
++        # edit source (untouched grounding span + frame-1 latents).
++        engine = self.text_processing_engine_qwen
++        engine.text_encoder.native_vision_inputs = getattr(opts, "krea2_moodboard_native_vision", True)
++        is_negative = getattr(prompt, "is_negative_prompt", False)
++
++        fuse_moodboard = bool(self.image_prompt) and not is_negative
++        if fuse_moodboard:
++            directive = ""
++            if self.moodboard_style_directive:
++                directive = self.KREA2_SUBJECT_DIRECTIVE if self.moodboard_extract == "subject" else self.KREA2_STYLE_DIRECTIVE
++            text = self.image_prompt + directive + self.edit_prompt + "".join(prompt)
++            images = [self.images_vl] + list(self.edit_images_vl)
++            engine.moodboard_strength = self.moodboard_strength
++            engine.moodboard_hide_refs = self.moodboard_hide_refs
++            engine.moodboard_extract = self.moodboard_extract
++            engine.moodboard_span_limit = 1  # the packed moodboard span leads; edit spans stay raw
++        else:
++            text = self.edit_prompt + "".join(prompt)
++            images = list(self.edit_images_vl)
++            engine.moodboard_span_limit = 0  # no moodboard spans in this encode
++
++        cond = engine([text], images=images)
++
++        engine.moodboard_strength = 1.0
++        engine.moodboard_hide_refs = False
++        engine.moodboard_extract = "style"
++        engine.moodboard_span_limit = None
++        if not is_negative:
++            dynamic_args["ref_latents"] = list(self.edit_ref_latents)
++            self.clear_edit()
++            self.clear_moodboard()
++        return cond
++
+     @torch.inference_mode()
+     def get_prompt_lengths_on_ui(self, prompt):
+         token_count = len(self.text_processing_engine_qwen.tokenize([prompt])[0])
+diff --git a/backend/nn/krea.py b/backend/nn/krea.py
+index ef33dad3..48cdc8a1 100644
+--- a/backend/nn/krea.py
++++ b/backend/nn/krea.py
+@@ -7,6 +7,7 @@ import torch.nn as nn
+ import torch.nn.functional as F
+ from einops import rearrange
+ 
++from backend.args import dynamic_args
+ from backend.attention import attention_function
+ from backend.memory_management import cast_to
+ from backend.nn.flux import EmbedND, apply_rope, timestep_embedding
+@@ -235,10 +236,28 @@ class SingleStreamDiT(nn.Module):
+         H, W = x.shape[-2], x.shape[-1]
+         h_, w_ = H // patch, W // patch
+ 
++        # In-context edit path (krea2_edit LoRAs): clean SOURCE latents are prepended as extra image
++        # blocks, distinguished from the noisy target only by the RoPE frame index (sources 1..N,
++        # target 0). Sequence becomes [text | source(s) | target]; only target tokens are returned.
++        # Ported from https://github.com/lbouaraba/comfyui-krea2edit — no-op when no refs are armed.
++        ref_latents = dynamic_args.get("ref_latents", None) or []
++        srcs = []
++        for source in ref_latents:
++            src = source.to(device=x.device, dtype=x.dtype)
++            if src.ndim == 5:
++                sb, sc, st, sh, sw = src.shape
++                src = src.reshape(sb * st, sc, sh, sw)
++            if src.shape[0] != bs:
++                src = src[:1].expand(bs, *src.shape[1:])
++            if src.shape[-2:] != (H, W):
++                src = F.interpolate(src.float(), size=(H, W), mode="bilinear").to(x.dtype)
++            srcs.append(pad_to_patch_size(src, (patch, patch)))
++
+         context = self._unpack_context(context.squeeze(1))
+ 
+         img = rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch)
+         img = self.first(img)
++        src_imgs = [self.first(rearrange(s_, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch)) for s_ in srcs]
+ 
+         t = self.tmlp(timestep_embedding(timesteps, self.tdim).unsqueeze(1).to(img.dtype))
+         tvec = self.tproj(t)
+@@ -247,7 +266,8 @@ class SingleStreamDiT(nn.Module):
+         context = self.txtmlp(context)
+ 
+         txtlen, imglen = context.shape[1], img.shape[1]
+-        combined = torch.cat((context, img), dim=1)
++        srclen = sum(si.shape[1] for si in src_imgs)
++        combined = torch.cat([context] + src_imgs + [img], dim=1)
+ 
+         device = combined.device
+         txtpos = torch.zeros(bs, txtlen, 3, device=device, dtype=torch.float32)
+@@ -255,7 +275,12 @@ class SingleStreamDiT(nn.Module):
+         imgids[..., 1] = torch.arange(h_, device=device, dtype=torch.float32)[:, None]
+         imgids[..., 2] = torch.arange(w_, device=device, dtype=torch.float32)[None, :]
+         imgpos = imgids.reshape(1, h_ * w_, 3).repeat(bs, 1, 1)
+-        pos = torch.cat((txtpos, imgpos), dim=1)
++        srcpos = []
++        for i in range(len(src_imgs)):
++            sp = imgpos.clone()
++            sp[..., 0] = i + 1
++            srcpos.append(sp)
++        pos = torch.cat([txtpos] + srcpos + [imgpos], dim=1)
+ 
+         freqs = self.pe_embedder(pos)
+ 
+@@ -263,7 +288,7 @@ class SingleStreamDiT(nn.Module):
+             combined = block(combined, tvec, freqs, None, transformer_options=transformer_options)
+ 
+         final = self.last(combined, t)
+-        out = final[:, txtlen : txtlen + imglen, :]
++        out = final[:, txtlen + srclen : txtlen + srclen + imglen, :]
+         out = rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h_, w=w_, ph=patch, pw=patch, c=self.channels)
+         out = out[:, :, :H_orig, :W_orig]
+         if temporal:
+diff --git a/backend/nn/llm/llama.py b/backend/nn/llm/llama.py
+index 4c184638..08919bf9 100644
+--- a/backend/nn/llm/llama.py
++++ b/backend/nn/llm/llama.py
+@@ -170,7 +170,7 @@ class Ministral3_3BConfig:
+     stop_tokens = [2]
+ 
+ 
+-def precompute_freqs_cis(head_dim, position_ids, theta, rope_scale=None, rope_dims=None, device=None):
++def precompute_freqs_cis(head_dim, position_ids, theta, rope_scale=None, rope_dims=None, device=None, interleaved_mrope=False):
+     if not isinstance(theta, list):
+         theta = [theta]
+ 
+@@ -188,16 +188,27 @@ def precompute_freqs_cis(head_dim, position_ids, theta, rope_scale=None, rope_di
+         inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+         position_ids_expanded = position_ids[:, None, :].float()
+         freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+-        emb = torch.cat((freqs, freqs), dim=-1)
+-        cos = emb.cos()
+-        sin = emb.sin()
+-        if rope_dims is not None and position_ids.shape[0] > 1:
+-            mrope_section = rope_dims * 2
+-            cos = torch.cat([m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1).unsqueeze(0)
+-            sin = torch.cat([m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1).unsqueeze(0)
++        if rope_dims is not None and position_ids.shape[0] > 1 and interleaved_mrope:
++            # Qwen3-VL interleaved MRoPE: T-freqs by default, H/W replace every 3rd dim.
++            freqs_inter = freqs[0].clone()
++            for axis_idx, offset in ((1, 1), (2, 2)):
++                length = rope_dims[axis_idx] * 3
++                idx = slice(offset, length, 3)
++                freqs_inter[..., idx] = freqs[axis_idx, ..., idx]
++            emb = torch.cat((freqs_inter, freqs_inter), dim=-1)
++            cos = emb.cos().unsqueeze(0)
++            sin = emb.sin().unsqueeze(0)
+         else:
+-            cos = cos.unsqueeze(1)
+-            sin = sin.unsqueeze(1)
++            emb = torch.cat((freqs, freqs), dim=-1)
++            cos = emb.cos()
++            sin = emb.sin()
++            if rope_dims is not None and position_ids.shape[0] > 1:
++                mrope_section = rope_dims * 2
++                cos = torch.cat([m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1).unsqueeze(0)
++                sin = torch.cat([m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1).unsqueeze(0)
++            else:
++                cos = cos.unsqueeze(1)
++                sin = sin.unsqueeze(1)
+ 
+         sin_split = sin.shape[-1] // 2
+         out.append((cos, sin[..., :sin_split], -sin[..., sin_split:]))
+@@ -438,7 +449,7 @@ class Llama2_(nn.Module):
+         else:
+             self.norm = None
+ 
+-    def forward(self, x, attention_mask=None, embeds=None, num_tokens=None, intermediate_output=None, final_layer_norm_intermediate=True, dtype=None, position_ids=None, embeds_info=[], past_key_values=None):
++    def forward(self, x, attention_mask=None, embeds=None, num_tokens=None, intermediate_output=None, final_layer_norm_intermediate=True, dtype=None, position_ids=None, embeds_info=[], past_key_values=None, visual_pos_masks=None, deepstack_embeds=None):
+         if embeds is not None:
+             x = embeds
+         else:
+@@ -455,7 +466,7 @@ class Llama2_(nn.Module):
+         if position_ids is None:
+             position_ids = torch.arange(past_len, past_len + seq_len, device=x.device).unsqueeze(0)
+ 
+-        freqs_cis = precompute_freqs_cis(self.config.head_dim, position_ids, self.config.rope_theta, self.config.rope_scale, self.config.rope_dims, device=x.device)
++        freqs_cis = precompute_freqs_cis(self.config.head_dim, position_ids, self.config.rope_theta, self.config.rope_scale, self.config.rope_dims, device=x.device, interleaved_mrope=getattr(self.config, "interleaved_mrope", False))
+ 
+         mask = None
+         if attention_mask is not None:
+@@ -503,6 +514,10 @@ class Llama2_(nn.Module):
+             if current_kv is not None:
+                 next_key_values.append(current_kv)
+ 
++            # DeepStack (Qwen3-VL): add per-level visual features into the first len() layers at image positions.
++            if deepstack_embeds is not None and i < len(deepstack_embeds):
++                x[visual_pos_masks] = x[visual_pos_masks] + deepstack_embeds[i].to(x)
++
+             if i == intermediate_output:
+                 intermediate = x.clone()
+ 
+@@ -688,9 +703,21 @@ class Qwen3VL(BaseLlama, nn.Module):
+ 
+     def preprocess_embed(self, embed, device):
+         if embed["type"] == "image":
+-            image, grid = qwen_vl.process_qwen2vl_images(embed["data"], patch_size=16, image_mean=[0.5, 0.5, 0.5], image_std=[0.5, 0.5, 0.5])
+-            merged, deepstack = self.visual(image.to(device, dtype=torch.float32), grid)
+-            return merged, {"grid": grid, "deepstack": deepstack}
++            # data may be a single (1, H, W, C) tensor or a LIST of them: a list is encoded per-image
++            # and packed into one contiguous span (a single image reference to the model — Krea2's
++            # moodboard uses this so multiple references cannot read as an N-panel grid).
++            data = embed["data"]
++            images = data if isinstance(data, list) else [data]
++            merged_all, deepstack_all, grids = [], [], []
++            for img in images:
++                image, grid = qwen_vl.process_qwen2vl_images(img, patch_size=16, image_mean=[0.5, 0.5, 0.5], image_std=[0.5, 0.5, 0.5])
++                merged, deepstack = self.visual(image.to(device, dtype=torch.float32), grid)
++                merged_all.append(merged)
++                deepstack_all.append(deepstack)
++                grids.append(grid)
++            merged = torch.cat(merged_all, dim=0)
++            deepstack = [torch.cat([ds[i] for ds in deepstack_all], dim=0) for i in range(len(deepstack_all[0]))]
++            return merged, {"grid": grids[0], "deepstack": deepstack, "packed": len(images) > 1}
+         return None, None
+ 
+     def build_image_inputs(self, embeds, embeds_info):
+@@ -700,7 +727,10 @@ class Qwen3VL(BaseLlama, nn.Module):
+ 
+         device = embeds.device
+         seq = embeds.shape[1]
+-        position_ids = qwen_vl.qwen2vl_mrope_position_ids(embeds_info, seq, device)
++        # Packed spans hold several images' tokens under one grid entry — per-image mrope geometry
++        # doesn't apply, so fall back to sequential 1D positions (splice-parity behavior) for them.
++        packed = any(isinstance(e.get("extra"), dict) and e["extra"].get("packed") for e in images)
++        position_ids = None if packed else qwen_vl.qwen2vl_mrope_position_ids(embeds_info, seq, device)
+ 
+         visual_pos_masks = torch.zeros((1, seq), dtype=torch.bool, device=device)
+         deepstack = None
+@@ -714,3 +744,12 @@ class Qwen3VL(BaseLlama, nn.Module):
+             else:
+                 deepstack = [torch.cat([deepstack[i], ds[i]], dim=0) for i in range(len(ds))]
+         return position_ids, visual_pos_masks, deepstack
++
++    def forward(self, x, attention_mask=None, embeds=None, num_tokens=None, intermediate_output=None, final_layer_norm_intermediate=True, dtype=None, embeds_info=[]):
++        # True: full native Qwen3-VL processing (DeepStack injection + 3-axis mrope) for image embeds.
++        # False: splice-only with sequential 1D positions — what ComfyUI's TE path (and therefore the
++        # community K2 tooling, including the krea2_edit LoRA training) actually runs.
++        position_ids, visual_pos_masks, deepstack = None, None, None
++        if getattr(self, "native_vision_inputs", True):
++            position_ids, visual_pos_masks, deepstack = self.build_image_inputs(embeds, embeds_info)
++        return super().forward(x, attention_mask=attention_mask, embeds=embeds, num_tokens=num_tokens, intermediate_output=intermediate_output, final_layer_norm_intermediate=final_layer_norm_intermediate, dtype=dtype, position_ids=position_ids, visual_pos_masks=visual_pos_masks, deepstack_embeds=deepstack)
+diff --git a/backend/text_processing/qwen3vl_engine.py b/backend/text_processing/qwen3vl_engine.py
+index 62375115..b5b6c404 100644
+--- a/backend/text_processing/qwen3vl_engine.py
++++ b/backend/text_processing/qwen3vl_engine.py
+@@ -37,7 +37,14 @@ class Qwen3VLTextProcessingEngine:
+         self.vision_block = "<|vision_start|><|image_pad|><|vision_end|>"
+ 
+     def tokenize(self, texts, images=[]):
+-        llama_texts = [((self.image_template.replace(self.vision_block, self.vision_block * len(images), 1) if images else self.llama_template).format(text)) if text else " " for text in texts]
++        def template_for(text):
++            # Texts that already carry their own vision blocks (Krea2 moodboard/edit conditioning)
++            # keep the descriptor template — the validated recipe encodes images under it.
++            if images and self.vision_block not in text:
++                return self.image_template.replace(self.vision_block, self.vision_block * len(images), 1)
++            return self.llama_template
++
++        llama_texts = [(template_for(text).format(text)) if text else " " for text in texts]
+         return self.tokenizer(llama_texts)["input_ids"]
+ 
+     def tokenize_line(self, line: str, images=[]):
+@@ -183,6 +190,22 @@ class Qwen3VLTextProcessingEngine:
+     def process_tokens(self, batch_tokens, batch_multipliers):
+         embeds, mask, count, info = self.process_embeds(batch_tokens)
+ 
++        # Spliced image spans grow the sequence beyond the token list — expand the multipliers to
++        # match (image rows get 1.0) or the emphasis broadcast below fails on any image input.
++        if embeds.shape[1] != len(batch_multipliers[0]):
++            sizes = iter([e["size"] for e in info if e.get("type") == "image"])
++            expanded = []
++            for t, m in zip(batch_tokens[0], batch_multipliers[0]):
++                try:
++                    int(t)
++                    expanded.append(m)
++                except TypeError:
++                    try:
++                        expanded.extend([1.0] * next(sizes))
++                    except StopIteration:
++                        pass
++            batch_multipliers = [expanded]
++
+         self.emphasis.tokens = batch_tokens
+         self.emphasis.multipliers = torch.asarray(batch_multipliers).to(embeds)
+         self.emphasis.z = embeds
+@@ -190,4 +213,66 @@ class Qwen3VLTextProcessingEngine:
+         embeds = self.emphasis.z
+ 
+         _, z = self.text_encoder(None, embeds=embeds, attention_mask=mask, num_tokens=count, embeds_info=info, intermediate_output=KREA2_TAP_LAYERS, final_layer_norm_intermediate=False)
++        z = self._apply_moodboard_effects(z, info)
++        return z
++
++    def _apply_moodboard_effects(self, z, info):
++        """Krea2 moodboard post-processing on the tapped hidden states (pre-strip z, spans from info).
++
++        hide_refs: DELETE the vision rows so the DiT never attends to reference tokens directly —
++        style arrives only through how the references re-contextualized the prompt tokens inside
++        the LLM (requires image tokens BEFORE the prompt; causally inert otherwise).
++
++        strength + extract: per-token RMSNorms downstream (LLM taps, DiT txtfusion) erase plain
++        magnitude scaling, so strength is an information knob. extract="style": lerp vision rows
++        toward a joint statistics signature (mean / mean+std / mean-std cycle — palette, texture
++        contrast, mood; subjects fade). extract="subject": whiten rows ((v - mean) / std) — style
++        statistics are removed while the token structure (subjects/composition) survives.
++
++        moodboard_span_limit: when the moodboard is fused with identity-edit conditioning, only the
++        LEADING span(s) belong to the moodboard — edit grounding spans that follow stay untouched.
++        """
++        spans = []
++        for e in info:
++            if e.get("type") != "image":
++                continue
++            start = e["index"]
++            end = start + e["size"]
++            if 0 <= start < end <= z.shape[2]:
++                spans.append((start, end))
++
++        limit = getattr(self, "moodboard_span_limit", None)
++        if limit is not None:
++            spans = spans[:limit]
++        if not spans:
++            return z
++
++        if getattr(self, "moodboard_hide_refs", False):
++            keep = torch.ones(z.shape[2], dtype=torch.bool, device=z.device)
++            for start, end in spans:
++                keep[start:end] = False
++            return z[:, :, keep]
++
++        strength = float(getattr(self, "moodboard_strength", 1.0))
++        if strength >= 1.0:
++            return z
++        strength = max(0.0, strength)
++
++        joint = torch.cat([z[:, :, start:end] for start, end in spans], dim=2)
++        mu = joint.mean(dim=2, keepdim=True)
++        sigma = joint.std(dim=2, keepdim=True)
++
++        if getattr(self, "moodboard_extract", "style") == "subject":
++            safe_sigma = sigma.clamp_min(1e-4)
++            for start, end in spans:
++                span = z[:, :, start:end]
++                whitened = (span - mu) / safe_sigma
++                z[:, :, start:end] = whitened + strength * (span - whitened)
++        else:
++            for start, end in spans:
++                span = z[:, :, start:end]
++                n = span.shape[2]
++                coef = torch.tensor([0.0, 1.0, -1.0], device=span.device, dtype=span.dtype).repeat((n + 2) // 3)[:n].view(1, 1, n, 1)
++                target = mu + coef * sigma
++                z[:, :, start:end] = target + strength * (span - target)
+         return z

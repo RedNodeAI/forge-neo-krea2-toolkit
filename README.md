@@ -1,0 +1,68 @@
+# Krea 2 Moodboard + Identity Edit for Forge Neo
+
+Two features for the **Krea 2 (K2)** model in [SD WebUI Forge Neo](https://github.com/Haoming02/sd-webui-forge-classic/tree/neo),
+built on a full native **Qwen3-VL** vision-encoder integration:
+
+## 🎨 Krea2 Moodboard
+Drop reference images into a gallery — generations inherit their **style / vibe** (like krea.ai's
+Moodboard). Training-free. Controls:
+- **Vibe strength** — 1.0 raw reference, lower = purer extract
+- **Vibe extract** — `style` (palette/texture/mood; subjects fade) or `subject` (composition survives,
+  style is whitened away so your prompt controls the look)
+- **Reference processing** — full image / quadrant crops / fine 4×4 tiles (tiles = strongest
+  composition-scrambling, style-only transfer)
+- **Style directive**, **Indirect vibe** (refs hidden from the image model — structurally cannot copy
+  pose/subject), image tokens before/after prompt
+- Multiple references are packed into ONE vision span → they blend into a joint vibe (and can't
+  trigger grid/collage outputs)
+
+## 👤 Krea2 Identity Edit
+Instruction-based, identity-preserving editing via community **krea2_edit LoRAs**
+([krea2_identity_edit_v1](https://civitai.com/models/2761113)). Port of
+[ComfyUI-Krea2Edit](https://github.com/lbouaraba/comfyui-krea2edit): dual conditioning —
+VAE source tokens at RoPE frame 1 (appearance) + image-grounded Qwen3-VL instruction encoding
+(semantics), grounded negative for CFG > 1, `grounding_px` likeness↔obedience dial, two-ref support,
+aspect-ratio handling (match source / crop source to your AR).
+
+**The two compose**: enable both to take identity from the edit source and style from the moodboard.
+
+## Requirements
+
+1. **Forge Neo** (neo branch). This bundle was built and tested against a July-2026 neo build —
+   see INSTALL.md for how the backend part is applied.
+2. **Qwen3-VL-4B text encoder with vision weights** in your Text Encoder dropdown:
+   [Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2) → `text_encoders/qwen3vl_4b_bf16.safetensors`
+   (the `fp8_scaled` variant also works — its vision tower is bf16 inside). Console logs
+   `Detected Qwen3-VL-4B (vision) text encoder` when correct.
+3. For Identity Edit: a krea2_edit LoRA at strength 1.0 (download from its civitai page — not bundled).
+
+## What's in this bundle
+
+| Item | What | Install |
+|---|---|---|
+| `extensions/` | the two UI extensions | copy into `<forge>/extensions/` |
+| `krea2-features-backend.patch` | one ~560-line `git apply` patch for 4 backend files (activates Neo's dormant native Qwen3-VL path + the feature hooks; fixes a latent emphasis crash on image-spliced prompts) | `git apply` from `<forge>` |
+
+Targets **current Forge Neo (neo branch, July 2026+)** — Neo's own Krea 2 support is required (it ships
+the Qwen3-VL encoder this builds on). See **INSTALL.md** for step-by-step instructions.
+
+## Quick settings reference
+
+- Moodboard "Krea vibe": extract **style**, strength 0.5, **fine tiles 4×4**, directive on, position after
+- Identity Edit: **Euler / Simple**; Turbo 8 steps CFG 1 (most edits) or Raw 20–40 steps CFG 3 (removals);
+  ≤2MP; grounding_px 768 (1024+ for people)
+- Prompting edits: describe only what changes; anchor with "this person"; one edit per pass
+
+## Credits & License
+
+- [Haoming02](https://github.com/Haoming02) — SD WebUI Forge Neo (this bundle's host application)
+- [ComfyUI](https://github.com/comfyanonymous/ComfyUI) — Qwen3-VL model code ported from `qwen35.py` /
+  `qwen3vl.py` / `llama.py` (source URLs in file headers, following Forge Neo's existing porting convention)
+- [lbouaraba/ComfyUI-Krea2Edit](https://github.com/lbouaraba/comfyui-krea2edit) (Apache-2.0) — the
+  identity-edit dual-conditioning recipe and DiT in-context forward this port implements; and the
+  krea2_identity_edit LoRA
+- ethanfel (ComfyUI-Krea2TextEncoder) & ostris — validated K2 vision-conditioning recipes
+- Krea.ai — Krea 2 (weights under the Krea 2 Community License; the LoRA is a Derivative Model — see its page)
+
+Code in this bundle is distributed under the same license as SD WebUI Forge Neo (AGPL-3.0).
+Not affiliated with Krea.ai, Haoming02, or the LoRA author.
