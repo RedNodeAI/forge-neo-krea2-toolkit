@@ -39,7 +39,9 @@ Instruction-based editing with the community [krea2_identity_edit LoRA](https://
 4. For editing: the identity-edit LoRA at strength 1.0 · Euler/Simple · Turbo 8 steps CFG 1 (most edits)
    or Raw 20–40 steps CFG 3 (removals) · ≤2MP
 
-Full details in the bundled README/INSTALL and on GitHub: **<REPO_URL_HERE>**
+Full details in the bundled README/INSTALL and on GitHub:
+- Forge Neo: **https://github.com/TdogCreations/forge-neo-krea2-toolkit**
+- ComfyUI nodes (moodboard + edit-fusion for Comfy users): **https://github.com/TdogCreations/ComfyUI-Krea2Moodboard**
 
 ### Credits
 [Haoming02](https://github.com/Haoming02) (Forge Neo) · [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
