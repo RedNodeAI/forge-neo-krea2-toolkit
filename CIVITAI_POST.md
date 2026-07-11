@@ -41,7 +41,7 @@ Instruction-based editing with the community [krea2_identity_edit LoRA](https://
 
 Full details in the bundled README/INSTALL and on GitHub:
 - Forge Neo: **https://github.com/TdogCreations/forge-neo-krea2-toolkit**
-- ComfyUI nodes (moodboard + edit-fusion for Comfy users): **https://github.com/TdogCreations/ComfyUI-Krea2Moodboard**
+- ComfyUI nodes (moodboard + identity edit + fusion, with ready-made example workflows): **https://github.com/TdogCreations/ComfyUI-Krea2Moodboard**
 
 ### Credits
 [Haoming02](https://github.com/Haoming02) (Forge Neo) · [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
