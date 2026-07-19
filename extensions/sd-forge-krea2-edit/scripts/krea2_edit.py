@@ -1,13 +1,16 @@
+import hashlib
 import math
+import os
+import re
 
 import gradio as gr
 import numpy as np
 import torch
 from PIL import Image
 
-from modules import images, scripts, sd_models
+from modules import images, scripts, sd_models, shared
 from modules.api import api
-from modules.processing import StableDiffusionProcessing
+from modules.processing import StableDiffusionProcessing, StableDiffusionProcessingTxt2Img, process_images
 from modules.shared import device, opts
 from modules.ui_components import InputAccordion
 
@@ -21,6 +24,35 @@ Raw 20 steps / CFG 3 for removals. Generate at &le;2MP.<br>
 v1.2 dials: <b>ref_boost</b> (try 2&ndash;6) pulls results toward the reference; AR mode <b>fit</b> matches v1.2 training and removes the AR-matching requirement.
 """
 
+# --- Auto face-ref prep: two identity-edit passes that rebuild the reference ---------------------
+PREP_VERSION = "v1"  # bump to invalidate cached prepped references when the prompts change
+
+PREP_STEP1 = (
+    "Extract a clean image of the person from the input image while preserving the same identity as "
+    "closely as possible. Keep the same sex presentation, ethnic appearance, skin tone, age range, "
+    "face shape, eye shape, nose shape, mouth shape, jawline, hairline, hairstyle, and natural "
+    "expression. Keep the person looking as similar to the input as possible. Remove anything that "
+    "blocks or distracts from the person. Remove hats, glasses, masks, jewelry, hands, props, held "
+    "objects, and any items covering the face or body. Keep only the person. Make the face fully "
+    "visible and unobstructed. Use a simple neutral background. Keep the lighting natural and "
+    "balanced. Keep the skin matte, dry-looking, realistic, and not glossy. Preserve natural facial "
+    "color, subtle cheek redness, slight blush, small blemishes, and normal skin variation. Do not "
+    "beautify or average the face."
+)
+
+PREP_STEP2 = (
+    "Create a clean identity reference headshot from the input image. Preserve the same person as "
+    "closely as possible, including their sex presentation, ethnic appearance, skin tone, age range, "
+    "face shape, eye shape, nose shape, mouth shape, jawline, hairline, and natural expression. "
+    "Show a centered front-facing head-and-upper-shoulders photo with the face looking straight at "
+    "the camera. Make the face fully visible and unobstructed. Remove hats, glasses, masks, jewelry, "
+    "hands, props, held items, and anything covering the face. Use a soft light gray or off-white "
+    "studio background instead of pure white. Use soft neutral studio lighting that keeps the facial "
+    "color natural and does not wash out the face. Preserve natural facial color, subtle cheek "
+    "redness, slight blush, minor blemishes, and normal skin variation. Keep the skin matte, "
+    "dry-looking, low-shine, and realistic, with a clean dry nose area."
+)
+
 
 class Krea2Edit(scripts.Script):
     sorting_priority = 531
@@ -32,6 +64,7 @@ class Krea2Edit(scripts.Script):
         self.armed_boost: float = 1.0
         self.armed_boost_a: float = 1.0
         self.armed_fit: bool = False
+        self.prep_cache: dict[str, Image.Image] = {}
 
     def title(self):
         return "Krea2 Identity Edit"
@@ -92,10 +125,16 @@ class Krea2Edit(scripts.Script):
                     info="same dial for the 1st image in two-ref setups; no effect with a single source",
                     elem_id=self.elem_id("edit_ref_boost_a"),
                 )
+            prep_ref = gr.Checkbox(
+                value=False,
+                label="Auto face-ref prep (2-pass)",
+                info="rebuilds the subject reference before editing: pass 1 extracts the clean, unobstructed person (removes hats/glasses/hands/props), pass 2 turns that into a front-facing identity headshot. Runs with your current sampler/steps/CFG and the edit LoRA. The result is cached on disk and reused whenever the same reference is used again.",
+                elem_id=self.elem_id("edit_ref_prep"),
+            )
 
-        return [enable, source, source_b, grounding_px, ar_mode, ref_boost, ref_boost_a]
+        return [enable, source, source_b, grounding_px, ar_mode, ref_boost, ref_boost_a, prep_ref]
 
-    def process(self, p: StableDiffusionProcessing, enable: bool, source, source_b, grounding_px: int = 768, ar_mode: str = "match source (resize output)", ref_boost: float = 1.0, ref_boost_a: float = 1.0):
+    def process(self, p: StableDiffusionProcessing, enable: bool, source, source_b, grounding_px: int = 768, ar_mode: str = "match source (resize output)", ref_boost: float = 1.0, ref_boost_a: float = 1.0, prep_ref: bool = False):
         if not (enable and source is not None and hasattr(p.sd_model, "arm_edit")):
             if self.cached_parameters is not None:
                 self.cached_parameters = None
@@ -121,6 +160,15 @@ class Krea2Edit(scripts.Script):
         self.armed_boost = float(ref_boost)
         self.armed_boost_a = float(ref_boost_a)
 
+        if prep_ref:
+            # The SUBJECT reference (2nd image in two-ref setups, the only image otherwise) is
+            # rebuilt into a clean identity headshot; the scene reference is left untouched.
+            subject_idx = 1 if len(sources) > 1 else 0
+            prepped, prep_key, prep_ok = self.prep_reference(p, sources[subject_idx])
+            if prep_ok:
+                sources[subject_idx] = prepped
+                p.extra_generation_params["Krea2 Edit ref prep"] = prep_key
+
         mode = str(ar_mode)
         self.armed_fit = mode.startswith("fit")
         if mode.startswith("match"):
@@ -137,7 +185,7 @@ class Krea2Edit(scripts.Script):
             f"{len(sources)} source(s) [{', '.join(f'{h & 0xFFFFFF:06x}' for h in hashes)}], grounding_px {self.armed_grounding}, AR {mode.split(' ')[0]}{boost_note}"
         )
 
-        cache: list[str | int] = [str(sd_models.model_data.forge_loading_parameters), self.armed_grounding, mode, p.width, p.height, self.armed_boost, self.armed_boost_a]
+        cache: list[str | int] = [str(sd_models.model_data.forge_loading_parameters), self.armed_grounding, mode, p.width, p.height, self.armed_boost, self.armed_boost_a, bool(prep_ref)]
         cache.extend(hashes)
 
         # Always bust while enabled: conds must be recomputed with the armed sources every run.
@@ -186,6 +234,100 @@ class Krea2Edit(scripts.Script):
             dynamic_args["ref_latents"].clear()
             dynamic_args.pop("ref_boosts", None)
             dynamic_args.pop("ref_fit", None)
+
+    # ---- Auto face-ref prep -------------------------------------------------------------------
+
+    @staticmethod
+    def prep_cache_dir() -> str:
+        return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ref_cache")
+
+    @staticmethod
+    def stable_image_key(img: Image.Image) -> str:
+        """Content hash that survives restarts (python's hash() is per-process randomized)."""
+        thumb = img.resize((64, 64), Image.Resampling.LANCZOS).convert("RGB")
+        return hashlib.md5(thumb.tobytes()).hexdigest()[:16]
+
+    def to_tensor(self, img: Image.Image) -> torch.Tensor:
+        image = images.flatten(img, opts.img2img_background_color)
+        arr = np.array(image, dtype=np.float32) / 255.0
+        return torch.from_numpy(arr).to(device=device, dtype=torch.float32).unsqueeze(0)
+
+    def run_edit_pass(self, p: StableDiffusionProcessing, source_img: Image.Image, prompt_text: str,
+                      width: int, height: int, seed: int) -> Image.Image | None:
+        """One nested identity-edit generation: arm the source, run txt2img with the given
+        instruction, return the image. Uses the outer run's sampler/steps/CFG (and its LoRA tags,
+        so the edit LoRA stays active) with the v1.2 fit geometry."""
+        lora_tags = "".join(re.findall(r"<lora:[^<>]+>", p.prompt or ""))
+        if not lora_tags:
+            print("[Krea2 Edit] ref prep: no <lora:...> tag found in the prompt - the prep passes "
+                  "need the edit LoRA active to preserve identity")
+        p.sd_model.arm_edit([self.to_tensor(source_img)], grounding_px=self.armed_grounding,
+                            ref_boost=self.armed_boost, fit_size=(height, width), fit_mode="fit")
+        p2 = StableDiffusionProcessingTxt2Img(
+            prompt=lora_tags + prompt_text,
+            negative_prompt="",
+            seed=seed,
+            sampler_name=p.sampler_name,
+            scheduler=getattr(p, "scheduler", None),
+            steps=p.steps,
+            cfg_scale=p.cfg_scale,
+            width=width,
+            height=height,
+            batch_size=1,
+            n_iter=1,
+        )
+        p2.scripts = None  # no nested extensions (including this one)
+        p2.do_not_save_samples = True
+        p2.do_not_save_grid = True
+        try:
+            processed = process_images(p2)
+        finally:
+            if hasattr(p.sd_model, "clear_edit"):
+                p.sd_model.clear_edit()
+            from backend.args import dynamic_args
+            dynamic_args["ref_latents"].clear()
+            dynamic_args.pop("ref_boosts", None)
+            dynamic_args.pop("ref_fit", None)
+        if shared.state.interrupted or not processed.images:
+            return None
+        return processed.images[0]
+
+    def prep_reference(self, p: StableDiffusionProcessing, img: Image.Image) -> tuple[Image.Image, str, bool]:
+        """Two-pass reference rebuild: 1) extract the clean, unobstructed person; 2) turn that into
+        a front-facing identity headshot. Cached on disk keyed by the source image's content hash,
+        so the same reference is only ever processed once. Returns (image, key, ok)."""
+        key = f"{self.stable_image_key(img)}-{PREP_VERSION}"
+        cached = self.prep_cache.get(key)
+        if cached is not None:
+            return cached, key, True
+        path = os.path.join(self.prep_cache_dir(), key + ".png")
+        if os.path.exists(path):
+            cached = Image.open(path).convert("RGB")
+            self.prep_cache[key] = cached
+            print(f"[Krea2 Edit] ref prep: reusing cached reference {key}.png")
+            return cached, key, True
+
+        seed = int(key[:8], 16) & 0x7FFFFFFF
+        sw, sh = img.size
+        scale = math.sqrt((1024 * 1024) / (sw * sh))
+        w1 = max(576, round(sw * scale / 64) * 64)
+        h1 = max(576, round(sh * scale / 64) * 64)
+        print(f"[Krea2 Edit] ref prep 1/2: extracting clean person ({w1}x{h1})")
+        step1 = self.run_edit_pass(p, img, PREP_STEP1, w1, h1, seed)
+        if step1 is None:
+            print("[Krea2 Edit] ref prep aborted - using the original reference")
+            return img, key, False
+        print("[Krea2 Edit] ref prep 2/2: building identity headshot (1024x1024)")
+        step2 = self.run_edit_pass(p, step1, PREP_STEP2, 1024, 1024, seed + 1)
+        if step2 is None:
+            print("[Krea2 Edit] ref prep aborted - using the original reference")
+            return img, key, False
+
+        os.makedirs(self.prep_cache_dir(), exist_ok=True)
+        step2.save(path)
+        self.prep_cache[key] = step2
+        print(f"[Krea2 Edit] ref prep: saved {path} - reused automatically for this reference")
+        return step2, key, True
 
     @staticmethod
     def bust_cond_caches(p: StableDiffusionProcessing):

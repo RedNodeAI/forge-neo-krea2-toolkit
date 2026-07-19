@@ -36,7 +36,14 @@ market"* — same face, same outfit, relit to the new scene.
 5. **ref_boost** (v1.2 dial): multiplies target→reference attention — 1.0 = off, >1 pulls the result
    harder toward the reference's appearance (the LoRA author suggests 2–6). The `ref_boost (scene)`
    slider is the same dial for the first image in two-ref setups.
-6. Two-ref LoRAs (experimental upstream): scene image in the first slot, subject in the second.
+6. **Auto face-ref prep (2-pass)**: rebuilds the subject reference before editing — pass 1 extracts
+   the clean, unobstructed person (removes hats/glasses/masks/hands/props, neutral background,
+   matte natural skin), pass 2 turns that into a centered front-facing identity headshot. Great when
+   the reference's face is partly covered. Runs two nested identity-edit generations with your
+   current sampler/steps/CFG and LoRA; the result is cached in the extension's `ref_cache/` folder
+   (keyed by the image's content hash) and reused automatically whenever the same reference is used
+   again — delete the file to force a redo. In two-ref setups only the subject (2nd) image is prepped.
+7. Two-ref LoRAs (experimental upstream): scene image in the first slot, subject in the second.
 
 ## Notes
 

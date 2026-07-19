@@ -32,6 +32,10 @@ aspect-ratio handling (match source / crop source to your AR / **fit**).
   resolution before VAE-encoding: blur-proof (latents are never resized), keeps your chosen AR
   (no more matching the source's), and matches the v1.2 LoRA's training geometry. The older
   match/crop modes remain for v1/v1.1 weights.
+- **Auto face-ref prep (2-pass)** — one toggle that rebuilds the subject reference before editing:
+  pass 1 extracts the clean, unobstructed person (hats/glasses/hands/props removed, matte natural
+  skin), pass 2 makes a front-facing identity headshot from it. Cached per reference image (content
+  hash) so it never re-runs for the same picture.
 
 **The two compose**: enable both to take identity from the edit source and style from the moodboard.
 
