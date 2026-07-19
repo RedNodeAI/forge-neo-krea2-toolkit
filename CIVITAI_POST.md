@@ -28,7 +28,10 @@ Instruction-based editing with the community [krea2_identity_edit LoRA](https://
 *"create a photo of this person at a night market"* — same face, same outfit, relit to the new scene.
 - Dual conditioning: in-context VAE tokens (RoPE frame 1) + image-grounded instruction encoding
 - Grounded negative (needed for CFG > 1 recipes), `grounding_px` likeness↔obedience dial, two-ref support,
-  aspect-ratio handling (match source, or crop source to your output AR)
+  aspect-ratio handling (match source, crop source to your output AR, or the new **fit**)
+- **v1.2 support**: `ref_boost` reference-fidelity dial (try 2–6) and the **fit** geometry — sources are
+  fitted in pixel space to your output resolution (blur-proof, no more AR-matching requirement,
+  matches the v1.2 LoRA's training)
 - **Composes with the Moodboard**: identity from the edit source + style from the moodboard in one gen
 
 ### Install (short version)
@@ -36,12 +39,12 @@ Instruction-based editing with the community [krea2_identity_edit LoRA](https://
 2. Copy the two folders from `extensions/` into `extensions/`
 3. Text encoder: [Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2) `qwen3vl_4b_bf16.safetensors`
    (or fp8_scaled) in the VAE/Text Encoder dropdown next to your K2 checkpoint
-4. For editing: the identity-edit LoRA at strength 1.0 · Euler/Simple · Turbo 8 steps CFG 1 (most edits)
-   or Raw 20–40 steps CFG 3 (removals) · ≤2MP
+4. For editing: the identity-edit LoRA at strength 1.0 · Euler/Simple · Turbo 8 steps CFG 1 (most edits;
+   v1.2 LoRA: 8–12 steps) or Raw 20–40 steps CFG 3 (removals) · ≤2MP
 
 Full details in the bundled README/INSTALL and on GitHub:
-- Forge Neo: **https://github.com/TdogCreations/forge-neo-krea2-toolkit**
-- ComfyUI nodes (moodboard + identity edit + fusion, with ready-made example workflows): **https://github.com/TdogCreations/ComfyUI-Krea2Moodboard**
+- Forge Neo: **https://github.com/RedNodeAI/forge-neo-krea2-toolkit**
+- ComfyUI nodes (moodboard + identity edit + fusion, with ready-made example workflows): **https://github.com/RedNodeAI/ComfyUI-Krea2Moodboard**
 
 ### Workflows included (ComfyUI)
 - **Basic moodboard t2i** and **identity edit + moodboard fusion** — lean examples, core nodes + the

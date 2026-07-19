@@ -15,8 +15,10 @@ info = """
 <b>Krea 2 Identity Edit</b> — instruction-based, identity-preserving editing for K2.<br>
 Give it a source image and write the edit instruction as your <b>prompt</b> ("create a photo of this person at a night market").<br>
 <b>Requires:</b> the qwen3vl_4b (vision) text encoder <b>and</b> a krea2_edit LoRA
-(e.g. <code>krea2_identity_edit_v1</code>) loaded at strength 1.0.<br>
-Recommended: Turbo 8 steps / CFG 1 for most edits; Raw 20 steps / CFG 3 for removals. Generate at &le;2MP.
+(e.g. <code>krea2_identity_edit_v1_2</code>) loaded at strength 1.0.<br>
+Recommended: Turbo 8 steps / CFG 1 for most edits (v1.2 LoRA: 8&ndash;12 steps &mdash; 8 favors composition, 12 face detail);
+Raw 20 steps / CFG 3 for removals. Generate at &le;2MP.<br>
+v1.2 dials: <b>ref_boost</b> (try 2&ndash;6) pulls results toward the reference; AR mode <b>fit</b> matches v1.2 training and removes the AR-matching requirement.
 """
 
 
@@ -27,6 +29,9 @@ class Krea2Edit(scripts.Script):
         self.cached_parameters: list[str | int] = None
         self.armed_tensors: list[torch.Tensor] = None
         self.armed_grounding: int = 768
+        self.armed_boost: float = 1.0
+        self.armed_boost_a: float = 1.0
+        self.armed_fit: bool = False
 
     def title(self):
         return "Krea2 Identity Edit"
@@ -62,16 +67,35 @@ class Krea2Edit(scripts.Script):
                 elem_id=self.elem_id("edit_grounding"),
             )
             ar_mode = gr.Radio(
-                choices=["match source (resize output)", "crop source to output AR", "off"],
+                choices=["match source (resize output)", "crop source to output AR", "fit source to output (v1.2)", "off"],
                 value="match source (resize output)",
                 label="Aspect ratio handling",
-                info="training pairs are same-size, so source and output ARs must agree: either the output adopts the source's AR at your target resolution, or the source is center-cropped to your chosen output AR",
+                info="match/crop: source and output ARs are made to agree (v1/v1.1 training geometry). fit (v1.2): the source is fitted in pixel space to the output grid before encoding — blur-proof, keeps your chosen output AR, matches how the v1.2 LoRA was trained",
                 elem_id=self.elem_id("edit_ar_mode"),
             )
+            with gr.Row():
+                ref_boost = gr.Slider(
+                    minimum=0.0,
+                    maximum=10.0,
+                    step=0.05,
+                    value=1.0,
+                    label="ref_boost",
+                    info="reference-fidelity dial: multiplies target→reference attention for the subject ref (the 2nd image when two are set). 1.0 = off; the v1.2 LoRA author suggests 2-6",
+                    elem_id=self.elem_id("edit_ref_boost"),
+                )
+                ref_boost_a = gr.Slider(
+                    minimum=0.0,
+                    maximum=10.0,
+                    step=0.05,
+                    value=1.0,
+                    label="ref_boost (scene)",
+                    info="same dial for the 1st image in two-ref setups; no effect with a single source",
+                    elem_id=self.elem_id("edit_ref_boost_a"),
+                )
 
-        return [enable, source, source_b, grounding_px, ar_mode]
+        return [enable, source, source_b, grounding_px, ar_mode, ref_boost, ref_boost_a]
 
-    def process(self, p: StableDiffusionProcessing, enable: bool, source, source_b, grounding_px: int = 768, ar_mode: str = "match source (resize output)"):
+    def process(self, p: StableDiffusionProcessing, enable: bool, source, source_b, grounding_px: int = 768, ar_mode: str = "match source (resize output)", ref_boost: float = 1.0, ref_boost_a: float = 1.0):
         if not (enable and source is not None and hasattr(p.sd_model, "arm_edit")):
             if self.cached_parameters is not None:
                 self.cached_parameters = None
@@ -94,8 +118,11 @@ class Krea2Edit(scripts.Script):
         if source_b is not None:
             sources.append(self.to_pil(source_b))
         self.armed_grounding = int(grounding_px)
+        self.armed_boost = float(ref_boost)
+        self.armed_boost_a = float(ref_boost_a)
 
         mode = str(ar_mode)
+        self.armed_fit = mode.startswith("fit")
         if mode.startswith("match"):
             sw, sh = sources[0].size
             scale = math.sqrt((p.width * p.height) / (sw * sh))
@@ -105,11 +132,12 @@ class Krea2Edit(scripts.Script):
             sources = [self.crop_to_ar(img, p.width, p.height) for img in sources]
 
         hashes = [self.hash_image(img) for img in sources]
+        boost_note = f", ref_boost {self.armed_boost:g}" + (f"/{self.armed_boost_a:g}" if len(sources) > 1 else "") if (self.armed_boost != 1.0 or (len(sources) > 1 and self.armed_boost_a != 1.0)) else ""
         p.extra_generation_params["Krea2 Edit"] = (
-            f"{len(sources)} source(s) [{', '.join(f'{h & 0xFFFFFF:06x}' for h in hashes)}], grounding_px {self.armed_grounding}, AR {mode.split(' ')[0]}"
+            f"{len(sources)} source(s) [{', '.join(f'{h & 0xFFFFFF:06x}' for h in hashes)}], grounding_px {self.armed_grounding}, AR {mode.split(' ')[0]}{boost_note}"
         )
 
-        cache: list[str | int] = [str(sd_models.model_data.forge_loading_parameters), self.armed_grounding, mode, p.width, p.height]
+        cache: list[str | int] = [str(sd_models.model_data.forge_loading_parameters), self.armed_grounding, mode, p.width, p.height, self.armed_boost, self.armed_boost_a]
         cache.extend(hashes)
 
         # Always bust while enabled: conds must be recomputed with the armed sources every run.
@@ -127,21 +155,37 @@ class Krea2Edit(scripts.Script):
 
             self.armed_tensors = tensors
 
-    def arm(self, p: StableDiffusionProcessing):
+    def arm(self, p: StableDiffusionProcessing, hr: bool = False):
         if self.armed_tensors is not None and hasattr(p.sd_model, "arm_edit"):
-            p.sd_model.arm_edit(self.armed_tensors, grounding_px=self.armed_grounding)
+            fit_size = None
+            if getattr(self, "armed_fit", False):
+                # fit geometry targets the resolution this pass actually samples at, so the
+                # hires pass re-fits (and re-encodes) the sources for its own grid.
+                if hr and getattr(p, "hr_upscale_to_y", 0) and getattr(p, "hr_upscale_to_x", 0):
+                    fit_size = (p.hr_upscale_to_y, p.hr_upscale_to_x)
+                else:
+                    fit_size = (p.height, p.width)
+            p.sd_model.arm_edit(
+                self.armed_tensors,
+                grounding_px=self.armed_grounding,
+                ref_boost=getattr(self, "armed_boost", 1.0),
+                ref_boost_a=getattr(self, "armed_boost_a", 1.0),
+                fit_size=fit_size,
+            )
 
     def process_batch(self, p: StableDiffusionProcessing, *args, **kwargs):
         self.arm(p)
 
     def before_hr(self, p: StableDiffusionProcessing, *args):
-        self.arm(p)
+        self.arm(p, hr=True)
 
     def postprocess(self, p: StableDiffusionProcessing, processed, *args):
         if self.armed_tensors is not None and hasattr(p.sd_model, "clear_edit"):
             p.sd_model.clear_edit()
             from backend.args import dynamic_args
             dynamic_args["ref_latents"].clear()
+            dynamic_args.pop("ref_boosts", None)
+            dynamic_args.pop("ref_fit", None)
 
     @staticmethod
     def bust_cond_caches(p: StableDiffusionProcessing):

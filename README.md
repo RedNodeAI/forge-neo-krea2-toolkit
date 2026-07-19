@@ -18,11 +18,20 @@ Moodboard). Training-free. Controls:
 
 ## 👤 Krea2 Identity Edit
 Instruction-based, identity-preserving editing via community **krea2_edit LoRAs**
-([krea2_identity_edit_v1](https://civitai.com/models/2761113)). Port of
+([krea2_identity_edit](https://civitai.com/models/2761113), weights also on
+[HF conradlocke/krea2-identity-edit](https://huggingface.co/conradlocke/krea2-identity-edit)). Port of
 [ComfyUI-Krea2Edit](https://github.com/lbouaraba/comfyui-krea2edit): dual conditioning —
 VAE source tokens at RoPE frame 1 (appearance) + image-grounded Qwen3-VL instruction encoding
 (semantics), grounded negative for CFG > 1, `grounding_px` likeness↔obedience dial, two-ref support,
-aspect-ratio handling (match source / crop source to your AR).
+aspect-ratio handling (match source / crop source to your AR / **fit**).
+
+**v1.2 dials** (matching the LoRA's v1.2 release):
+- **ref_boost** — reference-fidelity dial: multiplies target→reference attention (1.0 = off; the LoRA
+  author suggests 2–6). Separate `ref_boost (scene)` slider for the first image in two-ref setups.
+- **fit source to output (v1.2)** AR mode — the source is fitted in *pixel space* to your output
+  resolution before VAE-encoding: blur-proof (latents are never resized), keeps your chosen AR
+  (no more matching the source's), and matches the v1.2 LoRA's training geometry. The older
+  match/crop modes remain for v1/v1.1 weights.
 
 **The two compose**: enable both to take identity from the edit source and style from the moodboard.
 
@@ -41,7 +50,7 @@ aspect-ratio handling (match source / crop source to your AR).
 | Item | What | Install |
 |---|---|---|
 | `extensions/` | the two UI extensions | copy into `<forge>/extensions/` |
-| `krea2-features-backend.patch` | one ~560-line `git apply` patch for 4 backend files (activates Neo's dormant native Qwen3-VL path + the feature hooks; fixes a latent emphasis crash on image-spliced prompts) | `git apply` from `<forge>` |
+| `krea2-features-backend.patch` | one ~680-line `git apply` patch for 4 backend files (activates Neo's dormant native Qwen3-VL path + the feature hooks; fixes a latent emphasis crash on image-spliced prompts) | `git apply` from `<forge>` |
 
 Targets **current Forge Neo (neo branch, July 2026+)** — Neo's own Krea 2 support is required (it ships
 the Qwen3-VL encoder this builds on). See **INSTALL.md** for step-by-step instructions.
@@ -49,8 +58,9 @@ the Qwen3-VL encoder this builds on). See **INSTALL.md** for step-by-step instru
 ## Quick settings reference
 
 - Moodboard "Krea vibe": extract **style**, strength 0.5, **fine tiles 4×4**, directive on, position after
-- Identity Edit: **Euler / Simple**; Turbo 8 steps CFG 1 (most edits) or Raw 20–40 steps CFG 3 (removals);
-  ≤2MP; grounding_px 768 (1024+ for people)
+- Identity Edit: **Euler / Simple**; Turbo 8 steps CFG 1 (most edits; v1.2 LoRA: 8–12 steps — 8 favors
+  composition, 12 face detail) or Raw 20–40 steps CFG 3 (removals); ≤2MP; grounding_px 768 (1024+ for
+  people); with the v1.2 LoRA use AR mode **fit** and try ref_boost 2–6
 - Prompting edits: describe only what changes; anchor with "this person"; one edit per pass
 
 ## Credits & License

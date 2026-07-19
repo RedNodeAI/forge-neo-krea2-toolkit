@@ -2,7 +2,7 @@
 
 `<forge>` = your Forge Neo root folder (contains `webui.bat`, `backend/`, `extensions/`).
 
-## 1. Backend patch (one file, ~560 lines)
+## 1. Backend patch (one file, ~680 lines)
 
 From `<forge>`:
 
@@ -30,8 +30,10 @@ your Krea 2 checkpoint.
 
 ## 4. For Identity Edit
 
-A krea2_edit LoRA at strength 1.0, e.g. [krea2_identity_edit_v1](https://civitai.com/models/2761113)
-(not bundled).
+A krea2_edit LoRA at strength 1.0, e.g. [krea2_identity_edit](https://civitai.com/models/2761113)
+(not bundled; weights also on [HF conradlocke/krea2-identity-edit](https://huggingface.co/conradlocke/krea2-identity-edit)).
+With the **v1.2** LoRA, use AR mode "fit source to output (v1.2)", 8–12 steps on Turbo, and try
+ref_boost 2–6.
 
 ## 5. Restart the WebUI
 

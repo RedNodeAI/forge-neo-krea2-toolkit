@@ -1,5 +1,5 @@
 diff --git a/backend/diffusion_engine/krea.py b/backend/diffusion_engine/krea.py
-index 43865585..d77a85fb 100644
+index 43865585..fc8080f1 100644
 --- a/backend/diffusion_engine/krea.py
 +++ b/backend/diffusion_engine/krea.py
 @@ -1,13 +1,21 @@
@@ -24,7 +24,7 @@ index 43865585..d77a85fb 100644
  
  
  class Krea2(ForgeDiffusionEngine):
-@@ -35,11 +43,219 @@ class Krea2(ForgeDiffusionEngine):
+@@ -35,11 +43,269 @@ class Krea2(ForgeDiffusionEngine):
  
          self.is_wan = True
  
@@ -59,6 +59,8 @@ index 43865585..d77a85fb 100644
 +    def clear_edit(self):
 +        self.edit_images_vl = []
 +        self.edit_ref_latents = []
++        self.edit_ref_boosts = []
++        self.edit_ref_fit = []
 +        self.edit_prompt = ""
 +
 +    @property
@@ -136,14 +138,48 @@ index 43865585..d77a85fb 100644
 +        hide_note = ", refs hidden from DiT" if self.moodboard_hide_refs else ""
 +        print(f"[Krea2 Moodboard] armed {len(self.images_vl)} image(s){crops_note} packed into 1 vision span, ~{sum(token_counts)} vision tokens {token_counts}, extract {self.moodboard_extract}, strength {self.moodboard_strength:g}, position {self.moodboard_position}{directive_note}{hide_note}")
 +
++    @staticmethod
++    def _fit_image_px(samples: torch.Tensor, px_h: int, px_w: int, fit_mode: str = "fit") -> torch.Tensor:
++        """v1.2 'fit' geometry (pixel-space source prep, the blur/stretch fix): resample the IMAGE
++        to the target grid BEFORE VAE-encoding, so latents are never resized. fit = AR-preserving
++        fit-inside at the target's grid density, /16 floor-snapped and capped at the target's /16
++        floor (training-matched); near-matched AR (within 8%) fills the target grid exactly via a
++        minimal center-crop. crop = center-crop to the target AR then resize (v1/v1.1 geometry)."""
++        img = samples.float()
++        ih, iw = img.shape[-2:]
++        if fit_mode == "fit":
++            sc = min(px_h / ih, px_w / iw)
++            if ih * sc >= px_h * 0.92 and iw * sc >= px_w * 0.92:
++                s = max(px_h / ih, px_w / iw)
++                ch, cw = min(ih, int(round(px_h / s))), min(iw, int(round(px_w / s)))
++                y0, x0 = (ih - ch) // 2, (iw - cw) // 2
++                img = img[..., y0:y0 + ch, x0:x0 + cw]
++                nh, nw = px_h, px_w
++            else:
++                nh = min(max(16, int(ih * sc) // 16 * 16), max(16, px_h // 16 * 16))
++                nw = min(max(16, int(iw * sc) // 16 * 16), max(16, px_w // 16 * 16))
++            return torch.nn.functional.interpolate(img, size=(nh, nw), mode="bicubic", antialias=True).clamp(0, 1)
++        s = max(px_h / ih, px_w / iw)
++        ch, cw = min(ih, int(round(px_h / s))), min(iw, int(round(px_w / s)))
++        y0, x0 = (ih - ch) // 2, (iw - cw) // 2
++        img = img[..., y0:y0 + ch, x0:x0 + cw]
++        return torch.nn.functional.interpolate(img, size=(px_h, px_w), mode="bicubic", antialias=True).clamp(0, 1)
++
 +    @torch.inference_mode()
-+    def arm_edit(self, images: list[torch.Tensor], grounding_px: int = 768):
++    def arm_edit(self, images: list[torch.Tensor], grounding_px: int = 768,
++                 ref_boost: float = 1.0, ref_boost_a: float = 1.0,
++                 fit_size: tuple[int, int] | None = None, fit_mode: str = "fit"):
 +        """Arm identity-edit conditioning (for krea2_edit LoRAs, e.g. krea2_identity_edit_v1).
 +
 +        Dual conditioning, training-matched: each source image (1, H, W, C, values 0..1) is
 +        (1) grounded into the instruction through Qwen3-VL (semantic path) and (2) VAE-encoded for
 +        the DiT's in-context frame-1..N appearance path. Two-ref order: scene first, subject second.
-+        grounding_px caps the longest side fed to the VLM (the LoRA trained with 384-768px jitter)."""
++        grounding_px caps the longest side fed to the VLM (the LoRA trained with 384-768px jitter).
++
++        v1.2 dials: ref_boost multiplies target->reference attention for the LAST ref (the
++        subject; ref_boost_a covers the earlier refs), 1.0 = off, the LoRA author suggests 2-6.
++        fit_size=(height_px, width_px) enables the pixel-space 'fit' path: sources are fitted to
++        the output grid before encoding (blur-proof, removes the match-AR requirement)."""
 +        self.clear_edit()
 +        for image in images:
 +            samples = image.movedim(-1, 1)  # b, c, h, w
@@ -156,13 +192,23 @@ index 43865585..d77a85fb 100644
 +                vl = samples
 +            self.edit_images_vl.append(vl.movedim(1, -1)[:, :, :, :3])
 +
-+            # Appearance path: encode at source resolution; the DiT resizes in latent space.
-+            sample = self.forge_objects.vae.encode(samples.movedim(1, -1)[:, :, :, :3])
++            # Appearance path. fit_size: fit in PIXEL space to the output grid, then encode — the
++            # DiT never resizes these latents. Otherwise encode at source resolution (legacy).
++            if fit_size is not None:
++                enc = self._fit_image_px(samples[:, :3], int(fit_size[0]), int(fit_size[1]), fit_mode)
++            else:
++                enc = samples[:, :3]
++            sample = self.forge_objects.vae.encode(enc.movedim(1, -1))
 +            self.edit_ref_latents.append(self.forge_objects.vae.first_stage_model.process_in(sample))
++            self.edit_ref_fit.append(fit_size is not None and fit_mode == "fit")
 +
 +            self.edit_prompt += self.VISION_BLOCK
 +
-+        print(f"[Krea2 Edit] armed {len(self.edit_images_vl)} source image(s), grounding_px {grounding_px}")
++        n = len(self.edit_ref_latents)
++        self.edit_ref_boosts = [float(ref_boost_a)] * max(0, n - 1) + [float(ref_boost)] if n else []
++        boost_note = f", ref_boost {ref_boost:g}" + (f"/{ref_boost_a:g}" if n > 1 else "") if any(b != 1.0 for b in self.edit_ref_boosts) else ""
++        fit_note = f", fit {fit_mode} -> {fit_size[1]}x{fit_size[0]}" if fit_size is not None else ""
++        print(f"[Krea2 Edit] armed {n} source image(s), grounding_px {grounding_px}{boost_note}{fit_note}")
 +
 +    @torch.inference_mode()
 +    def get_learned_conditioning(self, prompt: "SdConditioning"):
@@ -175,6 +221,8 @@ index 43865585..d77a85fb 100644
 +            else:
 +                self.images_vl = []
 +                dynamic_args["ref_latents"].clear()
++                dynamic_args.pop("ref_boosts", None)
++                dynamic_args.pop("ref_fit", None)
          return self.text_processing_engine_qwen(prompt)
  
 +    @torch.inference_mode()
@@ -238,6 +286,8 @@ index 43865585..d77a85fb 100644
 +        engine.moodboard_span_limit = None
 +        if not is_negative:
 +            dynamic_args["ref_latents"] = list(self.edit_ref_latents)
++            dynamic_args["ref_boosts"] = list(self.edit_ref_boosts)
++            dynamic_args["ref_fit"] = list(self.edit_ref_fit)
 +            self.clear_edit()
 +            self.clear_moodboard()
 +        return cond
@@ -246,10 +296,17 @@ index 43865585..d77a85fb 100644
      def get_prompt_lengths_on_ui(self, prompt):
          token_count = len(self.text_processing_engine_qwen.tokenize([prompt])[0])
 diff --git a/backend/nn/krea.py b/backend/nn/krea.py
-index ef33dad3..48cdc8a1 100644
+index ef33dad3..8c733e50 100644
 --- a/backend/nn/krea.py
 +++ b/backend/nn/krea.py
-@@ -7,6 +7,7 @@ import torch.nn as nn
+@@ -1,5 +1,6 @@
+ # https://github.com/Comfy-Org/ComfyUI/blob/v0.26.1/comfy/ldm/krea2/model.py
+ 
++import math
+ from typing import Optional
+ 
+ import torch
+@@ -7,6 +8,7 @@ import torch.nn as nn
  import torch.nn.functional as F
  from einops import rearrange
  
@@ -257,7 +314,57 @@ index ef33dad3..48cdc8a1 100644
  from backend.attention import attention_function
  from backend.memory_management import cast_to
  from backend.nn.flux import EmbedND, apply_rope, timestep_embedding
-@@ -235,10 +236,28 @@ class SingleStreamDiT(nn.Module):
+@@ -51,6 +53,49 @@ class SwiGLU(nn.Module):
+         return self.down(F.silu(self.gate(x)).mul_(self.up(x)))
+ 
+ 
++def _fit_latent(src, H, W):
++    """Latent-space fallback fit for edit sources: center-crop to the target AR, then resize.
++    Equals plain bilinear at matched AR; at mismatched AR it crops instead of stretching
++    (v1.2 upstream fix — plain interpolate stretched mixed-AR people)."""
++    sh, sw = src.shape[-2:]
++    if (sh, sw) == (H, W):
++        return src
++    s = max(H / sh, W / sw)
++    ch, cw = min(sh, int(round(H / s))), min(sw, int(round(W / s)))
++    y0, x0 = (sh - ch) // 2, (sw - cw) // 2
++    src = src[..., y0:y0 + ch, x0:x0 + cw]
++    return F.interpolate(src.float(), size=(H, W), mode="bilinear")
++
++
++def _imgids_offset(bs, frame, gh, gw, th, tw, device):
++    """Stride-1 position grid for a (gh,gw) reference centered inside a (th,tw) target frame
++    (v1.2 'fit' geometry: pixels were resampled to the target grid density, so positions stay
++    stride-1 by construction). Equals the plain own-grid ids when gh==th and gw==tw."""
++    off_h, off_w = max(0, (th - gh) // 2), max(0, (tw - gw) // 2)
++    ids = torch.zeros(gh, gw, 3, device=device, dtype=torch.float32)
++    ids[..., 0] = frame
++    ids[..., 1] = (torch.arange(gh, device=device, dtype=torch.float32) + off_h)[:, None]
++    ids[..., 2] = (torch.arange(gw, device=device, dtype=torch.float32) + off_w)[None, :]
++    return ids.reshape(1, gh * gw, 3).repeat(bs, 1, 1)
++
++
++def _ref_attn_bias(boosts, txtlen, slens, tgtlen, device, dtype):
++    """ref_boost: additive attention-logit bias on the [text | refs... | target] sequence —
++    target rows get log(boost) on reference-key columns, i.e. it multiplies target->reference
++    attention weight before renormalization (last ref = the subject by convention)."""
++    offs = [txtlen]
++    for sl in slens:
++        offs.append(offs[-1] + sl)
++    rows0 = offs[-1]
++    L = rows0 + tgtlen
++    bias = torch.zeros(1, 1, L, L, device=device, dtype=dtype)
++    for i, b in enumerate(boosts):
++        if b == 1.0:
++            continue
++        bias[:, :, rows0:, offs[i]:offs[i] + slens[i]] = math.log(max(b, 1e-4))
++    return bias
++
++
+ class Attention(nn.Module):
+     def __init__(self, dim: int, heads: int, kvheads: Optional[int] = None, bias: bool = False):
+         super().__init__()
+@@ -235,10 +280,38 @@ class SingleStreamDiT(nn.Module):
          H, W = x.shape[-2], x.shape[-1]
          h_, w_ = H // patch, W // patch
  
@@ -266,16 +373,26 @@ index ef33dad3..48cdc8a1 100644
 +        # target 0). Sequence becomes [text | source(s) | target]; only target tokens are returned.
 +        # Ported from https://github.com/lbouaraba/comfyui-krea2edit — no-op when no refs are armed.
 +        ref_latents = dynamic_args.get("ref_latents", None) or []
++        ref_boosts = list(dynamic_args.get("ref_boosts", None) or [])
++        ref_fit = list(dynamic_args.get("ref_fit", None) or [])
++        # Defensive alignment: pad from the LEFT so attached values always map to the LAST refs
++        # (last ref = the subject by workflow convention, matching the boost semantics).
++        n = len(ref_latents)
++        ref_boosts = [1.0] * max(0, n - len(ref_boosts)) + ref_boosts[-n:] if n else []
++        ref_fit = [False] * max(0, n - len(ref_fit)) + ref_fit[-n:] if n else []
 +        srcs = []
-+        for source in ref_latents:
++        for i, source in enumerate(ref_latents):
 +            src = source.to(device=x.device, dtype=x.dtype)
 +            if src.ndim == 5:
 +                sb, sc, st, sh, sw = src.shape
 +                src = src.reshape(sb * st, sc, sh, sw)
 +            if src.shape[0] != bs:
 +                src = src[:1].expand(bs, *src.shape[1:])
-+            if src.shape[-2:] != (H, W):
-+                src = F.interpolate(src.float(), size=(H, W), mode="bilinear").to(x.dtype)
++            # fit-prepared refs that fit inside the target keep their OWN grid (stride-1 offset
++            # positions below); everything else is fitted to the target grid in latent space.
++            native = ref_fit[i] and src.shape[-2] <= H and src.shape[-1] <= W
++            if src.shape[-2:] != (H, W) and not native:
++                src = _fit_latent(src, H, W).to(x.dtype)
 +            srcs.append(pad_to_patch_size(src, (patch, patch)))
 +
          context = self._unpack_context(context.squeeze(1))
@@ -286,7 +403,7 @@ index ef33dad3..48cdc8a1 100644
  
          t = self.tmlp(timestep_embedding(timesteps, self.tdim).unsqueeze(1).to(img.dtype))
          tvec = self.tproj(t)
-@@ -247,7 +266,8 @@ class SingleStreamDiT(nn.Module):
+@@ -247,23 +320,33 @@ class SingleStreamDiT(nn.Module):
          context = self.txtmlp(context)
  
          txtlen, imglen = context.shape[1], img.shape[1]
@@ -294,24 +411,29 @@ index ef33dad3..48cdc8a1 100644
 +        srclen = sum(si.shape[1] for si in src_imgs)
 +        combined = torch.cat([context] + src_imgs + [img], dim=1)
  
++        # Fit-geometry refs keep their own grid at a centered stride-1 offset; _imgids_offset equals
++        # the plain own-grid ids when a ref's grid matches the target's (bit-identical for non-fit refs).
          device = combined.device
          txtpos = torch.zeros(bs, txtlen, 3, device=device, dtype=torch.float32)
-@@ -255,7 +275,12 @@ class SingleStreamDiT(nn.Module):
++        src_grids = [(s_.shape[-2] // patch, s_.shape[-1] // patch) for s_ in srcs]
++        srcpos = [_imgids_offset(bs, i + 1, gh, gw, h_, w_, device) for i, (gh, gw) in enumerate(src_grids)]
+         imgids = torch.zeros(h_, w_, 3, device=device, dtype=torch.float32)
          imgids[..., 1] = torch.arange(h_, device=device, dtype=torch.float32)[:, None]
          imgids[..., 2] = torch.arange(w_, device=device, dtype=torch.float32)[None, :]
          imgpos = imgids.reshape(1, h_ * w_, 3).repeat(bs, 1, 1)
 -        pos = torch.cat((txtpos, imgpos), dim=1)
-+        srcpos = []
-+        for i in range(len(src_imgs)):
-+            sp = imgpos.clone()
-+            sp[..., 0] = i + 1
-+            srcpos.append(sp)
 +        pos = torch.cat([txtpos] + srcpos + [imgpos], dim=1)
  
          freqs = self.pe_embedder(pos)
  
-@@ -263,7 +288,7 @@ class SingleStreamDiT(nn.Module):
-             combined = block(combined, tvec, freqs, None, transformer_options=transformer_options)
++        attn_bias = None
++        if src_imgs and any(b != 1.0 for b in ref_boosts):
++            attn_bias = _ref_attn_bias(ref_boosts, txtlen, [si.shape[1] for si in src_imgs], imglen,
++                                       combined.device, combined.dtype)
++
+         for block in self.blocks:
+-            combined = block(combined, tvec, freqs, None, transformer_options=transformer_options)
++            combined = block(combined, tvec, freqs, attn_bias, transformer_options=transformer_options)
  
          final = self.last(combined, t)
 -        out = final[:, txtlen : txtlen + imglen, :]
