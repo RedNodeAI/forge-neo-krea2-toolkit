@@ -1,7 +1,11 @@
 # Krea 2 Moodboard + Identity Edit for Forge Neo
 
 Two features for the **Krea 2 (K2)** model in [SD WebUI Forge Neo](https://github.com/Haoming02/sd-webui-forge-classic/tree/neo),
-built on a full native **Qwen3-VL** vision-encoder integration:
+built on a full native **Qwen3-VL** vision-encoder integration.
+
+**On Civitai** (release zips + showcase):
+[civitai.com/models/2794961](https://civitai.com/models/2794961/krea-2-moodboard-identity-edit-comfyui-nodes-forge-neo)
+· ComfyUI sibling: [ComfyUI-Krea2Moodboard](https://github.com/RedNodeAI/ComfyUI-Krea2Moodboard)
 
 ## 🎨 Krea2 Moodboard
 Drop reference images into a gallery — generations inherit their **style / vibe** (like krea.ai's
