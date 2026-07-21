@@ -7,6 +7,9 @@ built on a full native **Qwen3-VL** vision-encoder integration.
 [civitai.com/models/2794961](https://civitai.com/models/2794961/krea-2-moodboard-identity-edit-comfyui-nodes-forge-neo)
 · ComfyUI sibling: [ComfyUI-Krea2Moodboard](https://github.com/RedNodeAI/ComfyUI-Krea2Moodboard)
 
+⚡ **Plug and play**: one backend patch + two extensions, everything in the normal txt2img UI —
+no ComfyUI, no node graphs, no dependency stack.
+
 ## 🎨 Krea2 Moodboard
 Drop reference images into a gallery — generations inherit their **style / vibe** (like krea.ai's
 Moodboard). Training-free. Controls:
