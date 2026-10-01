@@ -1,32 +1,38 @@
-**Installation for current Forge Neo (neo branch, 2.28 and newer)**
+**Installation for current Forge Neo (neo branch)**
 
 `<forge>` is your Forge Neo root folder (it has `webui.bat`, `backend/` and `extensions/` in it).
+Check your version at the bottom of the WebUI page.
 
-This bundle now ships Identity Edit only. Forge Neo 2.28 added its own Krea 2 edit and vision support,
-so the patch is small and builds on top of it. The Moodboard has not been ported yet; see the legacy
-section at the bottom.
+Forge Neo added its own Krea 2 edit and vision support in 2.28, which broke the July 2026 patch.
+The patches here are rebuilt on top of Neo's native support.
 
-**1. Backend patch (2 files, about 200 lines)**
+**1. Backend patch**
 
-From `<forge>`:
+Pick the one for your Neo version and run it from `<forge>`:
+
+| Neo version | Patch | Gives you |
+|---|---|---|
+| 2.29.1 and newer | `krea2-features-backend.patch` (4 files) | Moodboard and Identity Edit |
+| 2.28 to 2.29.0 | `krea2-identity-edit-backend.patch` (2 files) | Identity Edit only (or update Neo for the Moodboard) |
+| before 2.28 | `legacy/krea2-features-backend-july2026.patch` | Moodboard and Identity Edit, July 2026 build |
 
 ```
-git apply --verbose "path/to/krea2-identity-edit-backend.patch"
+git apply --verbose "path/to/krea2-features-backend.patch"
 ```
 
-It only touches `backend/diffusion_engine/krea.py` and `backend/nn/krea.py`. It adds ref_boost, the fit
-geometry, the grounding_px cap and the grounded negative on top of Neo's native Krea 2 reference path.
-Other models are not affected.
+The patches only touch Krea 2 and Qwen3-VL code. Other models are not affected. The Moodboard's
+native vision processing (DeepStack and 3-axis positions) only switches on while a Moodboard encode
+runs; everything else keeps Neo's own behaviour.
 
-If you applied the old `krea2-features-backend.patch` before, undo it first with
-`git checkout -- backend` from `<forge>`, then update Neo and apply the new one.
+If you applied an older patch before, undo it first with `git checkout -- backend` from `<forge>`,
+then update Neo and apply the new one.
 
 If `git apply` still reports conflicts, open an issue with your Neo version and commit.
 
-**2. Extension**
+**2. Extensions**
 
-Copy `extensions/sd-forge-krea2-edit` into `<forge>/extensions/`. If you have the old
-`sd-forge-krea2-moodboard` extension installed, remove it; it needs the old patch.
+Copy both folders from `extensions/` into `<forge>/extensions/`. With the Identity Edit patch, copy
+only `sd-forge-krea2-edit`. With the legacy patch, use the extensions in `legacy/extensions/`.
 
 **3. Text encoder**
 
@@ -34,22 +40,17 @@ Copy `extensions/sd-forge-krea2-edit` into `<forge>/extensions/`. If you have th
 (or `fp8_scaled`) into `<forge>/models/text_encoder/`, selected in the VAE / Text Encoder dropdown with
 your Krea 2 checkpoint.
 
-**4. The edit LoRA**
+**4. The edit LoRA (Identity Edit only)**
 
 A krea2_edit LoRA at strength 1.0, for example [krea2_identity_edit](https://civitai.com/models/2761113)
 (not bundled; weights also on [HF conradlocke/krea2-identity-edit](https://huggingface.co/conradlocke/krea2-identity-edit)).
 With the v1.2 LoRA use AR mode "fit source to output (v1.2)", 8 to 12 steps on Turbo, and try
 ref_boost 2 to 6.
 
-You do not need Neo's own "[Krea2] Enable Reference" setting for this extension. It works with the
+You do not need Neo's own "[Krea2] Enable Reference" setting for these extensions. They work with the
 setting on or off.
 
 **5. Restart the WebUI**
 
-The Krea2 Identity Edit accordion appears in txt2img and img2img.
-
-**Legacy: Forge Neo before 2.28**
-
-The `legacy/` folder keeps the July 2026 bundle: the old 4-file patch, the Moodboard extension and
-the Identity Edit extension that matches it. Use it only on a Neo build from July or August 2026; it
-does not apply to 2.28 or newer.
+The Krea2 Moodboard and Krea2 Identity Edit accordions appear in txt2img and img2img. The Moodboard
+settings live under Settings, Krea2 Moodboard.

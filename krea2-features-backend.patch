@@ -1,0 +1,546 @@
+diff --git a/backend/diffusion_engine/krea.py b/backend/diffusion_engine/krea.py
+index d82a7216..9e33b4b7 100644
+--- a/backend/diffusion_engine/krea.py
++++ b/backend/diffusion_engine/krea.py
+@@ -42,11 +42,229 @@ class Krea2(ForgeDiffusionEngine):
+ 
+         self.is_wan = True
+ 
++        # Identity Edit and Moodboard state, armed by the sd-forge-krea2-edit / -moodboard extensions,
++        # consumed by the next positive encode
++        self.clear_edit()
++        self.clear_moodboard()
++
++    @property
++    def moodboard_available(self) -> bool:
++        """Kept for the extensions' vision check; Neo only loads the Qwen3-VL encoder with its vision tower."""
++        return True
++
++    def clear_edit(self, release_refs: bool = False):
++        self.edit_images_vl: list[torch.Tensor] = []
++        self.edit_ref_latents: list[torch.Tensor] = []
++        self.edit_ref_boosts: list[float] = []
++        self.edit_ref_fit: list[bool] = []
++        if release_refs:
++            dynamic_args.ref_latents.clear()
++            dynamic_args.krea2_ref_boosts = None
++            dynamic_args.krea2_ref_fit = None
++
++    @staticmethod
++    def _fit_image_px(samples: torch.Tensor, px_h: int, px_w: int, fit_mode: str = "fit") -> torch.Tensor:
++        """Resample the source to the output grid in pixel space before VAE encoding (v1.2 geometry).
++        fit: AR-preserving fit inside the target, /16 snapped; within 8% AR it fills the grid via a minimal
++        center-crop. crop: center-crop to the target AR, then resize."""
++        img = samples.float()
++        ih, iw = img.shape[-2:]
++        if fit_mode == "fit":
++            sc = min(px_h / ih, px_w / iw)
++            if ih * sc >= px_h * 0.92 and iw * sc >= px_w * 0.92:
++                s = max(px_h / ih, px_w / iw)
++                ch, cw = min(ih, int(round(px_h / s))), min(iw, int(round(px_w / s)))
++                y0, x0 = (ih - ch) // 2, (iw - cw) // 2
++                img = img[..., y0 : y0 + ch, x0 : x0 + cw]
++                nh, nw = px_h, px_w
++            else:
++                nh = min(max(16, int(ih * sc) // 16 * 16), max(16, px_h // 16 * 16))
++                nw = min(max(16, int(iw * sc) // 16 * 16), max(16, px_w // 16 * 16))
++            return torch.nn.functional.interpolate(img, size=(nh, nw), mode="bicubic", antialias=True).clamp(0, 1)
++        s = max(px_h / ih, px_w / iw)
++        ch, cw = min(ih, int(round(px_h / s))), min(iw, int(round(px_w / s)))
++        y0, x0 = (ih - ch) // 2, (iw - cw) // 2
++        img = img[..., y0 : y0 + ch, x0 : x0 + cw]
++        return torch.nn.functional.interpolate(img, size=(px_h, px_w), mode="bicubic", antialias=True).clamp(0, 1)
++
++    @torch.inference_mode()
++    def arm_edit(self, images: list[torch.Tensor], grounding_px: int = 768, ref_boost: float = 1.0, ref_boost_a: float = 1.0, fit_size: tuple[int, int] | None = None, fit_mode: str = "fit"):
++        """Arm identity-edit sources, each (1, H, W, C) in 0..1, scene first and subject last.
++        grounding_px caps the longest side fed to Qwen3-VL. ref_boost scales target->reference attention for
++        the last ref, ref_boost_a for the earlier ones. fit_size=(h, w) fits sources to the output grid in
++        pixel space before encoding."""
++        self.clear_edit()
++        for image in images:
++            samples = image.movedim(-1, 1)[:, :3]  # b, c, h, w
++
++            h, w = samples.shape[2], samples.shape[3]
++            if grounding_px and max(h, w) > grounding_px:
++                scale_by = grounding_px / max(h, w)
++                vl = torch.nn.functional.interpolate(samples, size=(round(h * scale_by), round(w * scale_by)), mode="area")
++            else:
++                vl = samples
++            self.edit_images_vl.append(vl.movedim(1, -1))
++
++            if fit_size is not None:
++                enc = self._fit_image_px(samples, int(fit_size[0]), int(fit_size[1]), fit_mode)
++            else:
++                enc = torch.nn.functional.interpolate(samples, size=(round(h / 16) * 16, round(w / 16) * 16), mode="area")
++            sample = self.forge_objects.vae.encode(enc.movedim(1, -1))
++            self.edit_ref_latents.append(self.forge_objects.vae.first_stage_model.process_in(sample).squeeze(2))
++            self.edit_ref_fit.append(fit_size is not None and fit_mode == "fit")
++
++        n = len(self.edit_ref_latents)
++        self.edit_ref_boosts = [float(ref_boost_a)] * max(0, n - 1) + [float(ref_boost)] if n else []
++        boost_note = f", ref_boost {ref_boost:g}" + (f"/{ref_boost_a:g}" if n > 1 else "") if any(b != 1.0 for b in self.edit_ref_boosts) else ""
++        fit_note = f", fit {fit_mode} -> {fit_size[1]}x{fit_size[0]}" if fit_size is not None else ""
++        print(f"[Krea2 Edit] armed {n} source image(s), grounding_px {grounding_px}{boost_note}{fit_note}")
++
++    # Sentences next to the moodboard block: K2 reads the whole context as a description of the target image
++    KREA2_STYLE_DIRECTIVE = (
++        "The image uses only the art style, color palette, lighting, texture, rendering technique and "
++        "overall mood of the reference images. The subjects, objects and composition of the image come "
++        "from the following text description alone. "
++    )
++    KREA2_SUBJECT_DIRECTIVE = (
++        "The image depicts the same subjects, objects and composition as the reference images, "
++        "rendered in the art style described by the following text. "
++    )
++    VISION_BLOCK = "<|vision_start|><|image_pad|><|vision_end|>"
++
++    def clear_moodboard(self):
++        self.images_vl: list[torch.Tensor] = []
++        self.moodboard_strength = 1.0
++        self.moodboard_position = "before"
++        self.moodboard_extract = "style"
++        self.moodboard_style_directive = False
++        self.moodboard_hide_refs = False
++
++    @staticmethod
++    def _expand_style_crops(images: list[torch.Tensor], n: int = 2) -> list[torch.Tensor]:
++        """Split each reference into an n x n grid of order-shuffled crops: composition cannot survive,
++        palette / texture / lighting are in every crop."""
++        orders = {
++            2: (2, 0, 3, 1),
++            4: (10, 3, 12, 5, 0, 15, 6, 9, 2, 13, 4, 11, 8, 1, 14, 7),
++        }
++        order = orders.get(n) or tuple(range(n * n))
++        crops = []
++        for image in images:
++            h, w = image.shape[1] // n, image.shape[2] // n
++            grid = [image[:, r * h : (r + 1) * h, c * w : (c + 1) * w] for r in range(n) for c in range(n)]
++            crops.extend(grid[i] for i in order)
++        return crops
++
++    @torch.inference_mode()
++    def arm_moodboard(self, images: list[torch.Tensor], strength: float = 1.0, position: str = "before", crops: int = 0, style_directive: bool = False, hide_refs: bool = False, extract: str = "style"):
++        """Arm references (each (1, H, W, C) in 0..1) as style / vibe conditioning for the next positive encode.
++        strength 1.0 = raw reference detail, lower = purer extract. extract "style" or "subject".
++        position: image tokens "before" or "after" the prompt. crops: 0 whole, 2 quadrants, 4 fine tiles.
++        hide_refs drops the reference rows from the conditioning (needs position "before")."""
++        self.clear_moodboard()
++        self.moodboard_strength = float(strength)
++        self.moodboard_position = position
++        self.moodboard_extract = "subject" if str(extract).startswith("subject") else "style"
++        self.moodboard_style_directive = bool(style_directive)
++        self.moodboard_hide_refs = bool(hide_refs)
++
++        # vision pixel budget: 384x384 area (fast) or a 1 MP cap that never upscales
++        high_detail = str(getattr(opts, "krea2_moodboard_vision_budget", "384")).startswith("1024")
++        total = int(1024 * 1024) if high_detail else int(384 * 384)
++
++        n_refs = len(images)
++        if crops and crops > 1:
++            images = self._expand_style_crops(images, n=int(crops))
++            total = total // (3 if crops == 2 else 12)
++
++        token_counts = []
++        for image in images:
++            samples = image.movedim(-1, 1)  # b, c, h, w
++            scale_by = math.sqrt(total / (samples.shape[3] * samples.shape[2]))
++            if high_detail:
++                scale_by = min(1.0, scale_by)
++            width = round(samples.shape[3] * scale_by)
++            height = round(samples.shape[2] * scale_by)
++            s = torch.nn.functional.interpolate(samples, size=(height, width), mode="area")
++            self.images_vl.append(s.movedim(1, -1)[:, :, :, :3])
++            token_counts.append(max(1, height // 32) * max(1, width // 32))  # patch 16, spatial merge 2
++
++        crops_note = f" ({n_refs} reference(s) as {crops}x{crops} crops)" if crops and crops > 1 else ""
++        directive_note = ", directive" if self.moodboard_style_directive else ""
++        hide_note = ", refs hidden from DiT" if self.moodboard_hide_refs else ""
++        print(f"[Krea2 Moodboard] armed {len(self.images_vl)} image(s){crops_note} packed into 1 vision span, ~{sum(token_counts)} vision tokens {token_counts}, extract {self.moodboard_extract}, strength {self.moodboard_strength:g}, position {self.moodboard_position}{directive_note}{hide_note}")
++
++    def _moodboard_directive(self) -> str:
++        if not self.moodboard_style_directive:
++            return ""
++        return self.KREA2_SUBJECT_DIRECTIVE if self.moodboard_extract == "subject" else self.KREA2_STYLE_DIRECTIVE
++
++    def _encode_with_moodboard(self, texts: list[str], images: list, span_limit: int | None):
++        """One encode with the moodboard effects and the native Qwen3-VL path switched on, then reset."""
++        engine = self.text_processing_engine_qwen
++        transformer = engine.qwen_vl_module
++        transformer.native_vision_inputs = bool(getattr(opts, "krea2_moodboard_native_vision", True))
++        engine.moodboard_strength = self.moodboard_strength
++        engine.moodboard_extract = self.moodboard_extract
++        engine.moodboard_hide_refs = self.moodboard_hide_refs
++        engine.moodboard_span_limit = span_limit
++        try:
++            return engine(texts, images=images)
++        finally:
++            transformer.native_vision_inputs = False
++            engine.moodboard_strength = 1.0
++            engine.moodboard_extract = "style"
++            engine.moodboard_hide_refs = False
++            engine.moodboard_span_limit = None
++
++    @torch.inference_mode()
++    def get_learned_conditioning_moodboard(self, prompt: "SdConditioning"):
++        directive = self._moodboard_directive()
++        if self.moodboard_position == "after":
++            texts = [line + (" " + directive if directive else "") + self.VISION_BLOCK for line in prompt]
++        else:
++            texts = [self.VISION_BLOCK + directive + line for line in prompt]
++        # all references ride in ONE image entry, so they pack into one vision span (grid-safe)
++        cond = self._encode_with_moodboard(texts, [list(self.images_vl)], span_limit=None)
++        dynamic_args.ref_latents.clear()
++        dynamic_args.krea2_ref_boosts = None
++        dynamic_args.krea2_ref_fit = None
++        self.clear_moodboard()
++        return cond
++
++    @torch.inference_mode()
++    def get_learned_conditioning_edit(self, prompt: "SdConditioning"):
++        # The negative is grounded too (training's unconditional is an empty prompt + the same image), needed
++        # for CFG > 1. It runs first and leaves the armed state; the positive consumes it and publishes the refs.
++        # An armed moodboard fuses in front on the positive only: style from the moodboard, identity from the edit.
++        if self.images_vl and not prompt.is_negative_prompt:
++            lead = self.VISION_BLOCK + self._moodboard_directive() + self.VISION_BLOCK * len(self.edit_images_vl)
++            images = [list(self.images_vl)] + list(self.edit_images_vl)
++            cond = self._encode_with_moodboard([lead + line for line in prompt], images, span_limit=1)
++        else:
++            cond = self.text_processing_engine_qwen(prompt, images=list(self.edit_images_vl))
++        if not prompt.is_negative_prompt:
++            dynamic_args.ref_latents = list(self.edit_ref_latents)
++            dynamic_args.krea2_ref_boosts = list(self.edit_ref_boosts)
++            dynamic_args.krea2_ref_fit = list(self.edit_ref_fit)
++            self.ini_latent = None
++            self.clear_edit()
++            self.clear_moodboard()
++        return cond
++
+     @torch.inference_mode()
+     def get_learned_conditioning(self, prompt: "SdConditioning"):
+         memory_management.load_model_gpu(self.forge_objects.clip.patcher)
+ 
++        if self.edit_images_vl:
++            return self.get_learned_conditioning_edit(prompt)
++
++        if self.images_vl and not prompt.is_negative_prompt:
++            return self.get_learned_conditioning_moodboard(prompt)
++
+         if not prompt.is_negative_prompt:
++            dynamic_args.krea2_ref_boosts = None
++            dynamic_args.krea2_ref_fit = None
+             _references = [*self.ref_latents]
+             if self.ini_latent is not None:
+                 _references.insert(0, self.ini_latent)
+diff --git a/backend/nn/krea.py b/backend/nn/krea.py
+index eb5d9976..f48942e5 100644
+--- a/backend/nn/krea.py
++++ b/backend/nn/krea.py
+@@ -1,6 +1,7 @@
+ # https://github.com/Comfy-Org/ComfyUI/blob/v0.26.1/comfy/ldm/krea2/model.py
+ # https://github.com/lbouaraba/comfyui-krea2edit/blob/main/__init__.py
+ 
++import math
+ from typing import Optional
+ 
+ import torch
+@@ -25,6 +26,33 @@ def _imgids(bs: int, frame: int, h_: int, w_: int, device: torch.device) -> torc
+     return ids.reshape(1, h_ * w_, 3).repeat(bs, 1, 1)
+ 
+ 
++def _refids(bs: int, frame: int, gh: int, gw: int, th: int, tw: int, device: torch.device) -> torch.Tensor:
++    """Stride-1 ids for a (gh, gw) reference centered in a (th, tw) target; equals _imgids when the grids match."""
++    ids = _imgids(bs, frame, gh, gw, device)
++    ids[..., 1] += max(0, (th - gh) // 2)
++    ids[..., 2] += max(0, (tw - gw) // 2)
++    return ids
++
++
++def _align_last(values, n: int, default) -> list:
++    """Pad from the left so the given values map onto the last n refs (last ref = the subject)."""
++    values = list(values or [])[-n:] if n else []
++    return [default] * (n - len(values)) + values
++
++
++def _ref_attn_bias(boosts, txtlen, slens, tgtlen, device, dtype) -> torch.Tensor:
++    """ref_boost: log(boost) added to target->reference attention logits on [text | refs... | target]."""
++    offs = [txtlen]
++    for sl in slens:
++        offs.append(offs[-1] + sl)
++    rows0 = offs[-1]
++    bias = torch.zeros(1, 1, rows0 + tgtlen, rows0 + tgtlen, device=device, dtype=dtype)
++    for i, b in enumerate(boosts):
++        if b != 1.0:
++            bias[:, :, rows0:, offs[i] : offs[i] + slens[i]] = math.log(max(b, 1e-4))
++    return bias
++
++
+ class RMSNorm(nn.Module):
+     def __init__(self, features: int, eps: float = 1e-5):
+         super().__init__()
+@@ -246,15 +274,23 @@ class SingleStreamDiT(nn.Module):
+ 
+         ref_latents: list[torch.Tensor] = dynamic_args.ref_latents
+ 
++        # Krea2 Identity Edit extras: per-ref attention boost and fit flags, aligned to the LAST refs
++        n_refs = len(ref_latents)
++        ref_boosts = _align_last(getattr(dynamic_args, "krea2_ref_boosts", None), n_refs, 1.0)
++        ref_fit = _align_last(getattr(dynamic_args, "krea2_ref_fit", None), n_refs, False)
++
+         if (_edit := bool(ref_latents)) is True:
+             refs = []
+             ref_grids = []
+-            for ref in ref_latents:
+-                if x.shape[0] == 2:  # batch_cond_uncond
+-                    ref = torch.cat((ref, ref), dim=0)
+-                if ref.shape != x.shape:
++            for i, ref in enumerate(ref_latents):
++                if ref.shape[0] != x.shape[0]:  # batch_cond_uncond / batch size
++                    ref = ref[:1].repeat(x.shape[0], *([1] * (ref.ndim - 1)))
++                # fit-prepared refs that fit inside the target keep their own grid
++                native = ref_fit[i] and ref.shape[-2] <= H and ref.shape[-1] <= W
++                if ref.shape != x.shape and not native:
+                     ref = adaptive_resize(ref, W, H, "area", "center")
+-                refs.append(pad_to_patch_size(ref.to(x), (patch, patch), padding_mode="replicate"))
++                ref = pad_to_patch_size(ref.to(x), (patch, patch), padding_mode="replicate")
++                refs.append(ref)
+                 ref_grids.append((ref.shape[-2] // patch, ref.shape[-1] // patch))
+ 
+         img = rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch)
+@@ -282,7 +318,7 @@ class SingleStreamDiT(nn.Module):
+         txtpos = torch.zeros(bs, txtlen, 3, device=device, dtype=torch.float32)
+ 
+         if _edit:
+-            refids = [_imgids(bs, i + 1, gh, gw, device) for i, (gh, gw) in enumerate(ref_grids)]
++            refids = [_refids(bs, i + 1, gh, gw, h_, w_, device) for i, (gh, gw) in enumerate(ref_grids)]
+             imgids = _imgids(bs, 0, h_, w_, device)
+             pos = torch.cat((txtpos, *refids, imgids), dim=1)
+         else:
+@@ -294,8 +330,12 @@ class SingleStreamDiT(nn.Module):
+ 
+         freqs = self.pe_embedder(pos)
+ 
++        attn_bias = None
++        if _edit and any(b != 1.0 for b in ref_boosts):
++            attn_bias = _ref_attn_bias(ref_boosts, txtlen, [r.shape[1] for r in refs], imglen, device, combined.dtype)
++
+         for block in self.blocks:
+-            combined = block(combined, tvec, freqs, None, transformer_options=transformer_options)
++            combined = block(combined, tvec, freqs, attn_bias, transformer_options=transformer_options)
+ 
+         final = self.last(combined, t)
+         out = final[:, txtlen + reflen : txtlen + reflen + imglen, :]
+diff --git a/backend/nn/llm/llama.py b/backend/nn/llm/llama.py
+index 7af6e9a2..dd9e3081 100644
+--- a/backend/nn/llm/llama.py
++++ b/backend/nn/llm/llama.py
+@@ -171,7 +171,7 @@ class Ministral3_3BConfig:
+     stop_tokens = [2]
+ 
+ 
+-def precompute_freqs_cis(head_dim, position_ids, theta, rope_scale=None, rope_dims=None, device=None):
++def precompute_freqs_cis(head_dim, position_ids, theta, rope_scale=None, rope_dims=None, device=None, interleaved_mrope=False):
+     if not isinstance(theta, list):
+         theta = [theta]
+ 
+@@ -189,16 +189,26 @@ def precompute_freqs_cis(head_dim, position_ids, theta, rope_scale=None, rope_di
+         inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+         position_ids_expanded = position_ids[:, None, :].float()
+         freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+-        emb = torch.cat((freqs, freqs), dim=-1)
+-        cos = emb.cos()
+-        sin = emb.sin()
+-        if rope_dims is not None and position_ids.shape[0] > 1:
+-            mrope_section = rope_dims * 2
+-            cos = torch.cat([m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1).unsqueeze(0)
+-            sin = torch.cat([m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1).unsqueeze(0)
++        if rope_dims is not None and position_ids.shape[0] > 1 and interleaved_mrope:
++            # Qwen3-VL interleaved MRoPE: T freqs by default, H / W replace every 3rd dim
++            freqs_inter = freqs[0].clone()
++            for axis_idx, offset in ((1, 1), (2, 2)):
++                idx = slice(offset, rope_dims[axis_idx] * 3, 3)
++                freqs_inter[..., idx] = freqs[axis_idx, ..., idx]
++            emb = torch.cat((freqs_inter, freqs_inter), dim=-1)
++            cos = emb.cos().unsqueeze(0)
++            sin = emb.sin().unsqueeze(0)
+         else:
+-            cos = cos.unsqueeze(1)
+-            sin = sin.unsqueeze(1)
++            emb = torch.cat((freqs, freqs), dim=-1)
++            cos = emb.cos()
++            sin = emb.sin()
++            if rope_dims is not None and position_ids.shape[0] > 1:
++                mrope_section = rope_dims * 2
++                cos = torch.cat([m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1).unsqueeze(0)
++                sin = torch.cat([m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1).unsqueeze(0)
++            else:
++                cos = cos.unsqueeze(1)
++                sin = sin.unsqueeze(1)
+ 
+         sin_split = sin.shape[-1] // 2
+         out.append((cos, sin[..., :sin_split], -sin[..., sin_split:]))
+@@ -447,7 +457,7 @@ class Llama2_(nn.Module):
+         else:
+             self.norm = None
+ 
+-    def forward(self, x, attention_mask=None, embeds=None, num_tokens=None, intermediate_output=None, final_layer_norm_intermediate=True, dtype=None, position_ids=None, embeds_info=[], past_key_values=None):
++    def forward(self, x, attention_mask=None, embeds=None, num_tokens=None, intermediate_output=None, final_layer_norm_intermediate=True, dtype=None, position_ids=None, embeds_info=[], past_key_values=None, visual_pos_masks=None, deepstack_embeds=None):
+         if embeds is not None:
+             x = embeds
+         else:
+@@ -464,7 +474,7 @@ class Llama2_(nn.Module):
+         if position_ids is None:
+             position_ids = torch.arange(past_len, past_len + seq_len, device=x.device).unsqueeze(0)
+ 
+-        freqs_cis = precompute_freqs_cis(self.config.head_dim, position_ids, self.config.rope_theta, self.config.rope_scale, self.config.rope_dims, device=x.device)
++        freqs_cis = precompute_freqs_cis(self.config.head_dim, position_ids, self.config.rope_theta, self.config.rope_scale, self.config.rope_dims, device=x.device, interleaved_mrope=getattr(self.config, "interleaved_mrope", False))
+ 
+         mask = None
+         if attention_mask is not None:
+@@ -512,6 +522,10 @@ class Llama2_(nn.Module):
+             if current_kv is not None:
+                 next_key_values.append(current_kv)
+ 
++            # DeepStack (Qwen3-VL): per-level visual features added into the first layers at image positions
++            if deepstack_embeds is not None and i < len(deepstack_embeds):
++                x[visual_pos_masks] = x[visual_pos_masks] + deepstack_embeds[i].to(x)
++
+             if i == intermediate_output:
+                 intermediate = x.clone()
+ 
+@@ -697,9 +711,20 @@ class Qwen3VL(BaseLlama, nn.Module):
+ 
+     def preprocess_embed(self, embed, device):
+         if embed["type"] == "image":
+-            image, grid = qwen_vl.process_qwen2vl_images(embed["data"], patch_size=16, image_mean=[0.5, 0.5, 0.5], image_std=[0.5, 0.5, 0.5])
+-            merged, deepstack = self.visual(image.to(device, dtype=torch.float32), grid)
+-            return merged, {"grid": grid, "deepstack": deepstack}
++            # a LIST of images is encoded per image and packed into one span (Krea2 Moodboard: several
++            # references read as one image, never as an N-panel grid)
++            data = embed["data"]
++            images = data if isinstance(data, list) else [data]
++            merged_all, deepstack_all, grids = [], [], []
++            for img in images:
++                image, grid = qwen_vl.process_qwen2vl_images(img, patch_size=16, image_mean=[0.5, 0.5, 0.5], image_std=[0.5, 0.5, 0.5])
++                merged, deepstack = self.visual(image.to(device, dtype=torch.float32), grid)
++                merged_all.append(merged)
++                deepstack_all.append(deepstack)
++                grids.append(grid)
++            merged = torch.cat(merged_all, dim=0)
++            deepstack = [torch.cat([ds[i] for ds in deepstack_all], dim=0) for i in range(len(deepstack_all[0]))]
++            return merged, {"grid": grids[0], "deepstack": deepstack, "packed": len(images) > 1}
+         return None, None
+ 
+     def build_image_inputs(self, embeds, embeds_info):
+@@ -709,7 +734,9 @@ class Qwen3VL(BaseLlama, nn.Module):
+ 
+         device = embeds.device
+         seq = embeds.shape[1]
+-        position_ids = qwen_vl.qwen2vl_mrope_position_ids(embeds_info, seq, device)
++        # packed spans hold several images under one grid entry, so they keep sequential 1D positions
++        packed = any(isinstance(e.get("extra"), dict) and e["extra"].get("packed") for e in images)
++        position_ids = None if packed else qwen_vl.qwen2vl_mrope_position_ids(embeds_info, seq, device)
+ 
+         visual_pos_masks = torch.zeros((1, seq), dtype=torch.bool, device=device)
+         deepstack = None
+@@ -723,3 +750,12 @@ class Qwen3VL(BaseLlama, nn.Module):
+             else:
+                 deepstack = [torch.cat([deepstack[i], ds[i]], dim=0) for i in range(len(ds))]
+         return position_ids, visual_pos_masks, deepstack
++
++    def forward(self, x, attention_mask=None, embeds=None, num_tokens=None, intermediate_output=None, final_layer_norm_intermediate=True, dtype=None, embeds_info=[]):
++        # native_vision_inputs (set per encode by the Krea2 Moodboard): DeepStack + 3-axis mrope for image
++        # embeds. Off by default: splice-only with 1D positions, as in ComfyUI and the edit LoRA training.
++        self.last_embeds_info = embeds_info
++        position_ids, visual_pos_masks, deepstack = None, None, None
++        if getattr(self, "native_vision_inputs", False):
++            position_ids, visual_pos_masks, deepstack = self.build_image_inputs(embeds, embeds_info)
++        return self.model(x, attention_mask=attention_mask, embeds=embeds, num_tokens=num_tokens, intermediate_output=intermediate_output, final_layer_norm_intermediate=final_layer_norm_intermediate, dtype=dtype, position_ids=position_ids, embeds_info=embeds_info, visual_pos_masks=visual_pos_masks, deepstack_embeds=deepstack)
+diff --git a/backend/text_processing/krea2_engine.py b/backend/text_processing/krea2_engine.py
+index 26752b74..d4fad1a4 100644
+--- a/backend/text_processing/krea2_engine.py
++++ b/backend/text_processing/krea2_engine.py
+@@ -19,6 +19,18 @@ class Qwen3VL4BEngine:
+ 
+         self.vision_block = "<|vision_start|><|image_pad|><|vision_end|>"
+ 
++        # Krea2 Moodboard state, set by the diffusion engine around one encode
++        self.moodboard_strength = 1.0
++        self.moodboard_extract = "style"
++        self.moodboard_hide_refs = False
++        self.moodboard_span_limit = None
++
++    @property
++    def qwen_vl_module(self):
++        """The Qwen3VL module behind the clip wrapper (holds native_vision_inputs and last_embeds_info)."""
++        module = self.text_encoder.transformer
++        return module if hasattr(module, "build_image_inputs") else getattr(module, "transformer", module)
++
+     @property
+     def emphasis(self) -> "emphasis.Emphasis":
+         return emphasis.EmphasisNone()
+@@ -42,6 +54,7 @@ class Qwen3VL4BEngine:
+             else:
+                 chunk = self._tokenize_with_weights(line, images)
+                 cond = self.text_encoder.encode_token_weights(chunk)[0]
++                cond = self._apply_moodboard_effects(cond)
+                 tok_pairs = chunk[0]
+ 
+                 count_im_start = 0
+@@ -68,7 +81,9 @@ class Qwen3VL4BEngine:
+         return zs
+ 
+     def _tokenize_with_weights(self, text: str, images: list[torch.Tensor]) -> TOKEN_WEIGHTS:
+-        llama_text = self.llama_template.format(self.vision_block * len(images) + text.strip())
++        # texts that carry their own vision blocks (Krea2 Moodboard) keep them where they are
++        blocks = "" if self.vision_block in text else self.vision_block * len(images)
++        llama_text = self.llama_template.format(blocks + text.strip())
+         tokens = self.tokenizer.tokenize_with_weights(llama_text, disable_weights=True)
+ 
+         embed_count = 0
+@@ -81,3 +96,45 @@ class Qwen3VL4BEngine:
+                         embed_count += 1
+ 
+         return tokens
++
++    def _apply_moodboard_effects(self, z: torch.Tensor) -> torch.Tensor:
++        """Krea2 Moodboard post-processing of the tapped hidden states (1, layers, seq, dim), before the template strip.
++
++        hide_refs drops the vision rows, so style reaches the DiT only through the prompt tokens.
++        strength < 1 with extract "style" lerps vision rows toward a mean / mean+std / mean-std cycle of the
++        joint statistics (palette, texture, mood); "subject" lerps toward whitened rows (structure stays).
++        moodboard_span_limit keeps the effects on the leading spans when edit spans follow."""
++        hide = self.moodboard_hide_refs
++        strength = float(self.moodboard_strength)
++        if not hide and strength >= 1.0:
++            return z
++
++        info = getattr(self.qwen_vl_module, "last_embeds_info", None) or []
++        spans = [(e["index"], e["index"] + e["size"]) for e in info if e.get("type") == "image"]
++        spans = [(a, b) for a, b in spans if 0 <= a < b <= z.shape[2]]
++        if self.moodboard_span_limit is not None:
++            spans = spans[: self.moodboard_span_limit]
++        if not spans:
++            return z
++
++        if hide:
++            keep = torch.ones(z.shape[2], dtype=torch.bool, device=z.device)
++            for a, b in spans:
++                keep[a:b] = False
++            return z[:, :, keep]
++
++        strength = max(0.0, strength)
++        joint = torch.cat([z[:, :, a:b] for a, b in spans], dim=2)
++        mu = joint.mean(dim=2, keepdim=True)
++        sigma = joint.std(dim=2, keepdim=True)
++        z = z.clone()
++        for a, b in spans:
++            span = z[:, :, a:b]
++            if self.moodboard_extract == "subject":
++                target = (span - mu) / sigma.clamp_min(1e-4)
++            else:
++                n = span.shape[2]
++                coef = torch.tensor([0.0, 1.0, -1.0], device=span.device, dtype=span.dtype).repeat((n + 2) // 3)[:n].view(1, 1, n, 1)
++                target = mu + coef * sigma
++            z[:, :, a:b] = target + strength * (span - target)
++        return z
