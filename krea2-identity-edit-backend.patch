@@ -1,0 +1,207 @@
+diff --git a/backend/diffusion_engine/krea.py b/backend/diffusion_engine/krea.py
+index d82a7216..adee4eca 100644
+--- a/backend/diffusion_engine/krea.py
++++ b/backend/diffusion_engine/krea.py
+@@ -42,11 +42,104 @@ class Krea2(ForgeDiffusionEngine):
+ 
+         self.is_wan = True
+ 
++        # Identity Edit state, armed by the sd-forge-krea2-edit extension, consumed by the next positive encode
++        self.clear_edit()
++
++    @property
++    def moodboard_available(self) -> bool:
++        """Kept for the extensions' vision check; Neo only loads the Qwen3-VL encoder with its vision tower."""
++        return True
++
++    def clear_edit(self, release_refs: bool = False):
++        self.edit_images_vl: list[torch.Tensor] = []
++        self.edit_ref_latents: list[torch.Tensor] = []
++        self.edit_ref_boosts: list[float] = []
++        self.edit_ref_fit: list[bool] = []
++        if release_refs:
++            dynamic_args.ref_latents.clear()
++            dynamic_args.krea2_ref_boosts = None
++            dynamic_args.krea2_ref_fit = None
++
++    @staticmethod
++    def _fit_image_px(samples: torch.Tensor, px_h: int, px_w: int, fit_mode: str = "fit") -> torch.Tensor:
++        """Resample the source to the output grid in pixel space before VAE encoding (v1.2 geometry).
++        fit: AR-preserving fit inside the target, /16 snapped; within 8% AR it fills the grid via a minimal
++        center-crop. crop: center-crop to the target AR, then resize."""
++        img = samples.float()
++        ih, iw = img.shape[-2:]
++        if fit_mode == "fit":
++            sc = min(px_h / ih, px_w / iw)
++            if ih * sc >= px_h * 0.92 and iw * sc >= px_w * 0.92:
++                s = max(px_h / ih, px_w / iw)
++                ch, cw = min(ih, int(round(px_h / s))), min(iw, int(round(px_w / s)))
++                y0, x0 = (ih - ch) // 2, (iw - cw) // 2
++                img = img[..., y0 : y0 + ch, x0 : x0 + cw]
++                nh, nw = px_h, px_w
++            else:
++                nh = min(max(16, int(ih * sc) // 16 * 16), max(16, px_h // 16 * 16))
++                nw = min(max(16, int(iw * sc) // 16 * 16), max(16, px_w // 16 * 16))
++            return torch.nn.functional.interpolate(img, size=(nh, nw), mode="bicubic", antialias=True).clamp(0, 1)
++        s = max(px_h / ih, px_w / iw)
++        ch, cw = min(ih, int(round(px_h / s))), min(iw, int(round(px_w / s)))
++        y0, x0 = (ih - ch) // 2, (iw - cw) // 2
++        img = img[..., y0 : y0 + ch, x0 : x0 + cw]
++        return torch.nn.functional.interpolate(img, size=(px_h, px_w), mode="bicubic", antialias=True).clamp(0, 1)
++
++    @torch.inference_mode()
++    def arm_edit(self, images: list[torch.Tensor], grounding_px: int = 768, ref_boost: float = 1.0, ref_boost_a: float = 1.0, fit_size: tuple[int, int] | None = None, fit_mode: str = "fit"):
++        """Arm identity-edit sources, each (1, H, W, C) in 0..1, scene first and subject last.
++        grounding_px caps the longest side fed to Qwen3-VL. ref_boost scales target->reference attention for
++        the last ref, ref_boost_a for the earlier ones. fit_size=(h, w) fits sources to the output grid in
++        pixel space before encoding."""
++        self.clear_edit()
++        for image in images:
++            samples = image.movedim(-1, 1)[:, :3]  # b, c, h, w
++
++            h, w = samples.shape[2], samples.shape[3]
++            if grounding_px and max(h, w) > grounding_px:
++                scale_by = grounding_px / max(h, w)
++                vl = torch.nn.functional.interpolate(samples, size=(round(h * scale_by), round(w * scale_by)), mode="area")
++            else:
++                vl = samples
++            self.edit_images_vl.append(vl.movedim(1, -1))
++
++            if fit_size is not None:
++                enc = self._fit_image_px(samples, int(fit_size[0]), int(fit_size[1]), fit_mode)
++            else:
++                enc = torch.nn.functional.interpolate(samples, size=(round(h / 16) * 16, round(w / 16) * 16), mode="area")
++            sample = self.forge_objects.vae.encode(enc.movedim(1, -1))
++            self.edit_ref_latents.append(self.forge_objects.vae.first_stage_model.process_in(sample).squeeze(2))
++            self.edit_ref_fit.append(fit_size is not None and fit_mode == "fit")
++
++        n = len(self.edit_ref_latents)
++        self.edit_ref_boosts = [float(ref_boost_a)] * max(0, n - 1) + [float(ref_boost)] if n else []
++        boost_note = f", ref_boost {ref_boost:g}" + (f"/{ref_boost_a:g}" if n > 1 else "") if any(b != 1.0 for b in self.edit_ref_boosts) else ""
++        fit_note = f", fit {fit_mode} -> {fit_size[1]}x{fit_size[0]}" if fit_size is not None else ""
++        print(f"[Krea2 Edit] armed {n} source image(s), grounding_px {grounding_px}{boost_note}{fit_note}")
++
++    @torch.inference_mode()
++    def get_learned_conditioning_edit(self, prompt: "SdConditioning"):
++        # The negative is grounded too (training's unconditional is an empty prompt + the same image), needed
++        # for CFG > 1. It runs first and leaves the armed state; the positive consumes it and publishes the refs.
++        cond = self.text_processing_engine_qwen(prompt, images=list(self.edit_images_vl))
++        if not prompt.is_negative_prompt:
++            dynamic_args.ref_latents = list(self.edit_ref_latents)
++            dynamic_args.krea2_ref_boosts = list(self.edit_ref_boosts)
++            dynamic_args.krea2_ref_fit = list(self.edit_ref_fit)
++            self.ini_latent = None
++            self.clear_edit()
++        return cond
++
+     @torch.inference_mode()
+     def get_learned_conditioning(self, prompt: "SdConditioning"):
+         memory_management.load_model_gpu(self.forge_objects.clip.patcher)
+ 
++        if self.edit_images_vl:
++            return self.get_learned_conditioning_edit(prompt)
++
+         if not prompt.is_negative_prompt:
++            dynamic_args.krea2_ref_boosts = None
++            dynamic_args.krea2_ref_fit = None
+             _references = [*self.ref_latents]
+             if self.ini_latent is not None:
+                 _references.insert(0, self.ini_latent)
+diff --git a/backend/nn/krea.py b/backend/nn/krea.py
+index eb5d9976..f48942e5 100644
+--- a/backend/nn/krea.py
++++ b/backend/nn/krea.py
+@@ -1,6 +1,7 @@
+ # https://github.com/Comfy-Org/ComfyUI/blob/v0.26.1/comfy/ldm/krea2/model.py
+ # https://github.com/lbouaraba/comfyui-krea2edit/blob/main/__init__.py
+ 
++import math
+ from typing import Optional
+ 
+ import torch
+@@ -25,6 +26,33 @@ def _imgids(bs: int, frame: int, h_: int, w_: int, device: torch.device) -> torc
+     return ids.reshape(1, h_ * w_, 3).repeat(bs, 1, 1)
+ 
+ 
++def _refids(bs: int, frame: int, gh: int, gw: int, th: int, tw: int, device: torch.device) -> torch.Tensor:
++    """Stride-1 ids for a (gh, gw) reference centered in a (th, tw) target; equals _imgids when the grids match."""
++    ids = _imgids(bs, frame, gh, gw, device)
++    ids[..., 1] += max(0, (th - gh) // 2)
++    ids[..., 2] += max(0, (tw - gw) // 2)
++    return ids
++
++
++def _align_last(values, n: int, default) -> list:
++    """Pad from the left so the given values map onto the last n refs (last ref = the subject)."""
++    values = list(values or [])[-n:] if n else []
++    return [default] * (n - len(values)) + values
++
++
++def _ref_attn_bias(boosts, txtlen, slens, tgtlen, device, dtype) -> torch.Tensor:
++    """ref_boost: log(boost) added to target->reference attention logits on [text | refs... | target]."""
++    offs = [txtlen]
++    for sl in slens:
++        offs.append(offs[-1] + sl)
++    rows0 = offs[-1]
++    bias = torch.zeros(1, 1, rows0 + tgtlen, rows0 + tgtlen, device=device, dtype=dtype)
++    for i, b in enumerate(boosts):
++        if b != 1.0:
++            bias[:, :, rows0:, offs[i] : offs[i] + slens[i]] = math.log(max(b, 1e-4))
++    return bias
++
++
+ class RMSNorm(nn.Module):
+     def __init__(self, features: int, eps: float = 1e-5):
+         super().__init__()
+@@ -246,15 +274,23 @@ class SingleStreamDiT(nn.Module):
+ 
+         ref_latents: list[torch.Tensor] = dynamic_args.ref_latents
+ 
++        # Krea2 Identity Edit extras: per-ref attention boost and fit flags, aligned to the LAST refs
++        n_refs = len(ref_latents)
++        ref_boosts = _align_last(getattr(dynamic_args, "krea2_ref_boosts", None), n_refs, 1.0)
++        ref_fit = _align_last(getattr(dynamic_args, "krea2_ref_fit", None), n_refs, False)
++
+         if (_edit := bool(ref_latents)) is True:
+             refs = []
+             ref_grids = []
+-            for ref in ref_latents:
+-                if x.shape[0] == 2:  # batch_cond_uncond
+-                    ref = torch.cat((ref, ref), dim=0)
+-                if ref.shape != x.shape:
++            for i, ref in enumerate(ref_latents):
++                if ref.shape[0] != x.shape[0]:  # batch_cond_uncond / batch size
++                    ref = ref[:1].repeat(x.shape[0], *([1] * (ref.ndim - 1)))
++                # fit-prepared refs that fit inside the target keep their own grid
++                native = ref_fit[i] and ref.shape[-2] <= H and ref.shape[-1] <= W
++                if ref.shape != x.shape and not native:
+                     ref = adaptive_resize(ref, W, H, "area", "center")
+-                refs.append(pad_to_patch_size(ref.to(x), (patch, patch), padding_mode="replicate"))
++                ref = pad_to_patch_size(ref.to(x), (patch, patch), padding_mode="replicate")
++                refs.append(ref)
+                 ref_grids.append((ref.shape[-2] // patch, ref.shape[-1] // patch))
+ 
+         img = rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch)
+@@ -282,7 +318,7 @@ class SingleStreamDiT(nn.Module):
+         txtpos = torch.zeros(bs, txtlen, 3, device=device, dtype=torch.float32)
+ 
+         if _edit:
+-            refids = [_imgids(bs, i + 1, gh, gw, device) for i, (gh, gw) in enumerate(ref_grids)]
++            refids = [_refids(bs, i + 1, gh, gw, h_, w_, device) for i, (gh, gw) in enumerate(ref_grids)]
+             imgids = _imgids(bs, 0, h_, w_, device)
+             pos = torch.cat((txtpos, *refids, imgids), dim=1)
+         else:
+@@ -294,8 +330,12 @@ class SingleStreamDiT(nn.Module):
+ 
+         freqs = self.pe_embedder(pos)
+ 
++        attn_bias = None
++        if _edit and any(b != 1.0 for b in ref_boosts):
++            attn_bias = _ref_attn_bias(ref_boosts, txtlen, [r.shape[1] for r in refs], imglen, device, combined.dtype)
++
+         for block in self.blocks:
+-            combined = block(combined, tvec, freqs, None, transformer_options=transformer_options)
++            combined = block(combined, tvec, freqs, attn_bias, transformer_options=transformer_options)
+ 
+         final = self.last(combined, t)
+         out = final[:, txtlen + reflen : txtlen + reflen + imglen, :]

@@ -10,7 +10,12 @@ built on a full native **Qwen3-VL** vision-encoder integration.
 ⚡ **Plug and play**: one backend patch + two extensions, everything in the normal txt2img UI —
 no ComfyUI, no node graphs, no dependency stack.
 
-## 🎨 Krea2 Moodboard
+> **October 2026 update, Forge Neo 2.28 and newer:** Neo now has its own Krea 2 edit and vision
+> support, which broke the old patch. The bundle at the top level is now Identity Edit only, with a
+> small 2-file patch built on Neo's native support. The Moodboard below needs the old patch and lives
+> in `legacy/` for Neo builds from before 2.28. See INSTALL.md.
+
+## 🎨 Krea2 Moodboard (legacy, Neo before 2.28)
 Drop reference images into a gallery — generations inherit their **style / vibe** (like krea.ai's
 Moodboard). Training-free. Controls:
 - **Vibe strength** — 1.0 raw reference, lower = purer extract
@@ -44,27 +49,25 @@ aspect-ratio handling (match source / crop source to your AR / **fit**).
   skin), pass 2 makes a front-facing identity headshot from it. Cached per reference image (content
   hash) so it never re-runs for the same picture.
 
-**The two compose**: enable both to take identity from the edit source and style from the moodboard.
+**The two compose** on the legacy bundle only: enable both to take identity from the edit source and style from the moodboard.
 
 ## Requirements
 
-1. **Forge Neo** (neo branch). This bundle was built and tested against a July-2026 neo build —
-   see INSTALL.md for how the backend part is applied.
+1. **Forge Neo** (neo branch), 2.28 or newer for the main bundle. Older builds from July 2026 use `legacy/`.
 2. **Qwen3-VL-4B text encoder with vision weights** in your Text Encoder dropdown:
    [Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2) → `text_encoders/qwen3vl_4b_bf16.safetensors`
-   (the `fp8_scaled` variant also works — its vision tower is bf16 inside). Console logs
-   `Detected Qwen3-VL-4B (vision) text encoder` when correct.
-3. For Identity Edit: a krea2_edit LoRA at strength 1.0 (download from its civitai page — not bundled).
+   (the `fp8_scaled` variant also works).
+3. For Identity Edit: a krea2_edit LoRA at strength 1.0 (download from its civitai page, not bundled).
 
 ## What's in this bundle
 
 | Item | What | Install |
 |---|---|---|
-| `extensions/` | the two UI extensions | copy into `<forge>/extensions/` |
-| `krea2-features-backend.patch` | one ~680-line `git apply` patch for 4 backend files (activates Neo's dormant native Qwen3-VL path + the feature hooks; fixes a latent emphasis crash on image-spliced prompts) | `git apply` from `<forge>` |
+| `extensions/sd-forge-krea2-edit` | the Identity Edit extension | copy into `<forge>/extensions/` |
+| `krea2-identity-edit-backend.patch` | a 2-file `git apply` patch that adds ref_boost, fit geometry, grounding_px and the grounded negative on top of Neo's native Krea 2 edit | `git apply` from `<forge>` |
+| `legacy/` | the July 2026 bundle: the 4-file patch, the Moodboard and the matching Identity Edit extension | Neo before 2.28 only |
 
-Targets **current Forge Neo (neo branch, July 2026+)** — Neo's own Krea 2 support is required (it ships
-the Qwen3-VL encoder this builds on). See **INSTALL.md** for step-by-step instructions.
+See **INSTALL.md** for step-by-step instructions.
 
 ## Quick settings reference
 
