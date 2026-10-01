@@ -10,7 +10,7 @@ built on a full native **Qwen3-VL** vision-encoder integration.
 ⚡ **Plug and play**: one backend patch + two extensions, everything in the normal txt2img UI —
 no ComfyUI, no node graphs, no dependency stack.
 
-> **October 2026 update:** Forge Neo 2.28 added its own Krea 2 edit and vision support, which broke
+> **v3.0, October 2026:** Forge Neo 2.28 added its own Krea 2 edit and vision support, which broke
 > the July patch. The patches are rebuilt on top of Neo's native support: the full patch needs Neo
 > 2.29.1 or newer, an Identity Edit only patch covers 2.28 to 2.29.0, and the July bundle lives in
 > `legacy/` for older builds. See INSTALL.md.
