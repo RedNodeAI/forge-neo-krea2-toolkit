@@ -3,9 +3,10 @@
 Renders a picture again from itself through an ai-toolkit Krea 2 edit LoRA, for example Anything2Real
 (illustration in, photograph out). It is the Forge Neo version of the Re-render tab in RedNode Studio for ComfyUI.
 
-How it works: the source is desaturated, cropped and sized to the output, read by Qwen3-VL at 384x384 area under
-a "Picture 1:" label, and VAE-encoded at up to 1 MP as the reference. The reference is conditioned at t=0 the way
-ai-toolkit trains these LoRAs:
+How it works, matching the workflow's Easy_QwenEdit2509 encode: the source is desaturated, cropped and sized to
+the output, scaled to the Vision size squared (384 by default) for Qwen3-VL under a "Picture 1:" label with the
+workflow's own system instruction, and VAE-encoded at the output size as the reference. The reference is
+conditioned at t=0 the way ai-toolkit trains these LoRAs:
 
 - **KV cache**: the reference runs once at t=0, attending only to itself, and its keys and values join every
   step's attention. For LoRAs trained with ai-toolkit's kv_cache option, Anything2Real among them.
@@ -19,7 +20,8 @@ ai-toolkit trains these LoRAs:
 4. Generate. In img2img, denoise below 1 keeps part of the source.
 
 The instruction replaces the prompt text; the default is "transform the image to realistic photograph".
-Saturation -20, longest side 1536 and rounding 512 are the recipe's values.
+Saturation -20, longest side 1536, rounding 512, vision size 384 and the system instruction are the recipe's
+values. Clearing the system instruction uses Krea's plain template instead (the Ostris encoder).
 
 Needs the Krea 2 toolkit backend patch (`krea2-features-backend.patch`) and the qwen3vl_4b text encoder with its
 vision weights.

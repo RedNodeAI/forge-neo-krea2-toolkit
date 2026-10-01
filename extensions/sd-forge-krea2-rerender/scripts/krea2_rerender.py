@@ -21,8 +21,12 @@ part of it.<br>
 
 WANT = "transform the image to realistic photograph"
 REF_MODES = ["KV cache (kv_cache LoRAs, Anything2Real)", "t=0 in sequence (other ai-toolkit edit LoRAs)"]
-VL_AREA = 384 * 384  # what the vision encoder sees, as in ai-toolkit training
-REF_AREA = 1024 * 1024  # the reference latent carries the detail
+# Easy_QwenEdit2509's own system instruction, as the workflow runs it
+SYSTEM = (
+    "Describe the key features of the input image (color, shape, size, texture, objects, background), "
+    "then explain how the user's text instruction should alter or modify the image. Generate a new image "
+    "that meets the user's requirements while maintaining consistency with the original input where appropriate."
+)
 
 
 class Krea2Rerender(scripts.Script):
@@ -33,6 +37,8 @@ class Krea2Rerender(scripts.Script):
         self.armed: torch.Tensor = None
         self.armed_mode: str = "kv"
         self.armed_instruction: str = WANT
+        self.armed_system: str = SYSTEM
+        self.armed_vl: int = 384
 
     def title(self):
         return "Krea2 Re-render"
@@ -56,6 +62,13 @@ class Krea2Rerender(scripts.Script):
                 label="Instruction",
                 info="Replaces the prompt text for the re-render. LoRA tags in the prompt still apply",
                 elem_id=self.elem_id("rerender_instruction"),
+            )
+            system = gr.Textbox(
+                value=SYSTEM,
+                lines=3,
+                label="System instruction",
+                info="What the encoder is told to be. The default is the workflow's own; clear it to use Krea's plain template",
+                elem_id=self.elem_id("rerender_system"),
             )
             ref_mode = gr.Radio(
                 choices=REF_MODES,
@@ -90,6 +103,15 @@ class Krea2Rerender(scripts.Script):
                     info="Output sides snap to this; the source is center-cropped to match",
                     elem_id=self.elem_id("rerender_round"),
                 )
+            vl_size = gr.Slider(
+                minimum=64,
+                maximum=2048,
+                step=64,
+                value=384,
+                label="Vision size",
+                info="The source is scaled to this squared area for Qwen3-VL (up or down). Higher reads more detail",
+                elem_id=self.elem_id("rerender_vl_size"),
+            )
             recipe = gr.Checkbox(
                 value=True,
                 label="Use the recipe sampling",
@@ -97,7 +119,7 @@ class Krea2Rerender(scripts.Script):
                 elem_id=self.elem_id("rerender_recipe"),
             )
 
-        return [enable, source, instruction, ref_mode, saturation, longest, round_to, recipe]
+        return [enable, source, instruction, ref_mode, saturation, longest, round_to, recipe, system, vl_size]
 
     def _source(self, p, source):
         if source is not None:
@@ -106,7 +128,7 @@ class Krea2Rerender(scripts.Script):
             return self.to_pil(p.init_images[0])
         return None
 
-    def before_process(self, p: StableDiffusionProcessing, enable: bool, source, instruction: str = WANT, ref_mode: str = REF_MODES[0], saturation: float = -20, longest: int = 1536, round_to: str = "512", recipe: bool = True):
+    def before_process(self, p: StableDiffusionProcessing, enable: bool, source, instruction: str = WANT, ref_mode: str = REF_MODES[0], saturation: float = -20, longest: int = 1536, round_to: str = "512", recipe: bool = True, system: str = SYSTEM, vl_size: int = 384):
         if not enable:
             return
         img = self._source(p, source)
@@ -122,7 +144,7 @@ class Krea2Rerender(scripts.Script):
             p.override_settings["beta_dist_alpha"] = 0.5
             p.override_settings["beta_dist_beta"] = 0.7
 
-    def process(self, p: StableDiffusionProcessing, enable: bool, source, instruction: str = WANT, ref_mode: str = REF_MODES[0], saturation: float = -20, longest: int = 1536, round_to: str = "512", recipe: bool = True):
+    def process(self, p: StableDiffusionProcessing, enable: bool, source, instruction: str = WANT, ref_mode: str = REF_MODES[0], saturation: float = -20, longest: int = 1536, round_to: str = "512", recipe: bool = True, system: str = SYSTEM, vl_size: int = 384):
         img = self._source(p, source) if enable else None
         if img is None or not hasattr(p.sd_model, "arm_edit"):
             if self.cached_parameters is not None:
@@ -135,11 +157,14 @@ class Krea2Rerender(scripts.Script):
 
         self.armed_mode = "t0" if str(ref_mode).startswith("t=0") else "kv"
         self.armed_instruction = (instruction or "").strip() or WANT
+        self.armed_system = (system or "").strip()
+        self.armed_vl = int(vl_size)
         prepared = self.prepare(img, float(saturation), p.width, p.height)
 
-        p.extra_generation_params["Krea2 Re-render"] = f"{self.armed_mode}, saturation {saturation:g}, {p.width}x{p.height}, instruction: {self.armed_instruction}"
+        system_note = "workflow system" if self.armed_system == SYSTEM else ("custom system" if self.armed_system else "Krea template")
+        p.extra_generation_params["Krea2 Re-render"] = f"{self.armed_mode}, {system_note}, vision {self.armed_vl}, saturation {saturation:g}, {p.width}x{p.height}, instruction: {self.armed_instruction}"
 
-        key = [str(sd_models.model_data.forge_loading_parameters), self.armed_mode, self.armed_instruction, float(saturation), p.width, p.height, self.hash_image(prepared)]
+        key = [str(sd_models.model_data.forge_loading_parameters), self.armed_mode, self.armed_instruction, self.armed_system, self.armed_vl, float(saturation), p.width, p.height, self.hash_image(prepared)]
         self.bust_cond_caches(p)
         if self.cached_parameters != key or self.armed is None:
             self.cached_parameters = key
@@ -152,9 +177,9 @@ class Krea2Rerender(scripts.Script):
                 [self.armed],
                 ref_mode=self.armed_mode,
                 picture_labels=True,
-                vl_area=VL_AREA,
-                ref_area=REF_AREA,
+                vl_size=self.armed_vl,
                 instruction=self.armed_instruction,
+                system_prompt=self.armed_system or None,
             )
 
     def process_batch(self, p: StableDiffusionProcessing, *args, **kwargs):
