@@ -12,8 +12,8 @@ Pick the one for your Neo version and run it from `<forge>`:
 
 | Neo version | Patch | Gives you |
 |---|---|---|
-| 2.29.1 and newer | `krea2-features-backend.patch` (4 files) | Moodboard and Identity Edit |
-| 2.28 to 2.29.0 | `krea2-identity-edit-backend.patch` (2 files) | Identity Edit only (or update Neo for the Moodboard) |
+| 2.29.1 and newer | `krea2-features-backend.patch` (4 files) | Moodboard, Identity Edit and Re-render |
+| 2.28 to 2.29.0 | `krea2-identity-edit-backend.patch` (2 files) | Identity Edit only (or update Neo for the Moodboard and Re-render) |
 | before 2.28 | `legacy/krea2-features-backend-july2026.patch` | Moodboard and Identity Edit, July 2026 build |
 
 ```
@@ -31,7 +31,7 @@ If `git apply` still reports conflicts, open an issue with your Neo version and 
 
 **2. Extensions**
 
-Copy both folders from `extensions/` into `<forge>/extensions/`. With the Identity Edit patch, copy
+Copy the three folders from `extensions/` into `<forge>/extensions/`. With the Identity Edit patch, copy
 only `sd-forge-krea2-edit`. With the legacy patch, use the extensions in `legacy/extensions/`.
 
 **3. Text encoder**
@@ -50,7 +50,12 @@ ref_boost 2 to 6.
 You do not need Neo's own "[Krea2] Enable Reference" setting for these extensions. They work with the
 setting on or off.
 
-**5. Restart the WebUI**
+**5. For Re-render**
 
-The Krea2 Moodboard and Krea2 Identity Edit accordions appear in txt2img and img2img. The Moodboard
+An ai-toolkit Krea 2 edit LoRA, for example Anything2Real (not bundled), in your prompt at strength 1.0.
+Keep "Use the recipe sampling" on and the Reference mode on KV cache for Anything2Real.
+
+**6. Restart the WebUI**
+
+The Krea2 Moodboard, Krea2 Identity Edit and Krea2 Re-render accordions appear in txt2img and img2img. The Moodboard
 settings live under Settings, Krea2 Moodboard.
